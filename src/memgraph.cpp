@@ -26,7 +26,6 @@
 #include "auth/auth.hpp"
 #include "communication/cluster_tls.hpp"
 #include "communication/v2/server.hpp"
-#include "communication/websocket/auth.hpp"
 #include "communication/websocket/server.hpp"
 #include "coordination/coordinator_state.hpp"
 #include "coordination/data_instance_management_server_handlers.hpp"
@@ -46,6 +45,7 @@
 #include "glue/auth_checker.hpp"
 #include "glue/auth_handler.hpp"
 #include "glue/run_id.hpp"
+#include "glue/websocket_auth.hpp"
 #include "helpers.hpp"
 #include "license/license_sender.hpp"
 #include "memory/global_memory_control.hpp"
@@ -1055,7 +1055,7 @@ int main(int argc, char **argv) {
                                                            memory_limit,
                                                            memgraph::license::global_license_checker.GetLicenseInfo());
 
-  memgraph::communication::websocket::SafeAuth websocket_auth{auth_.get()};
+  memgraph::glue::SafeAuth websocket_auth{auth_.get()};
   memgraph::communication::websocket::Server websocket_server{
       {FLAGS_monitoring_address, static_cast<uint16_t>(FLAGS_monitoring_port)}, &bolt_server_context, websocket_auth};
 

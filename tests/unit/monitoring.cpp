@@ -45,7 +45,7 @@ struct MockAuth : public memgraph::communication::websocket::AuthenticationInter
     return authentication;
   }
 
-  bool HasPermission(memgraph::auth::Permission /*permission*/) const override { return authorization; }
+  bool HasWebsocketPermission() const override { return authorization; }
 
   bool AccessControlled() const override { return has_any_users; }
 
