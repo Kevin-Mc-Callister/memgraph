@@ -28,7 +28,6 @@
 #include "communication/v2/server.hpp"
 #include "communication/websocket/server.hpp"
 #include "coordination/coordinator_state.hpp"
-#include "coordination/data_instance_management_server_handlers.hpp"
 #include "dbms/constants.hpp"
 #include "dbms/dbms_handler.hpp"
 #include "flags/all.hpp"
@@ -63,6 +62,7 @@
 #include "query/procedure/py_module.hpp"
 #endif
 #include "replication/state.hpp"
+#include "replication_handler/data_instance_management_server_handlers.hpp"
 #include "replication_handler/replication_handler.hpp"
 #include "requests/requests.hpp"
 #include "storage/v2/config.hpp"
