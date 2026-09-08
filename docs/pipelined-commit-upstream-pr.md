@@ -1,7 +1,7 @@
 # Pipelined commit: encode the WAL outside the commit serializer (experimental)
 
-Draft pull-request text for memgraph/memgraph. Not opened; kept here until the base branch question is settled (the
-implementation sits on top of `feat/adaptive-commit-lock-scheduling`, memgraph#4777, which is not merged).
+Pull-request text. The implementation sits on top of `feat/adaptive-commit-lock-scheduling` (memgraph#4777), which
+is not merged; the base branch is that head merged into `master`.
 
 ## Problem
 
@@ -81,35 +81,28 @@ Refusal never blocks: it converts the commit into the ordered legacy path after 
 
 ## Measurements
 
-Box: 16 cores, WAL on, `--storage-delta-on-identical-property-update=false`, the writer sweep from
-`tests/manual/unique_constraint_property_update_bench.py` (100,000 Node/Value pairs, batches of 1,000 rows, medians
-of 3 trials). Latencies in milliseconds per transaction. See `docs/pipelined-commit-borgdev-report.md` for the full
-tables (48- and 96-batch trials) and the production measurement.
+Local (16-core box, WAL on, `--storage-delta-on-identical-property-update=false`, the writer sweep from
+`tests/manual/unique_constraint_property_update_bench.py`: 100,000 Node/Value pairs, 48 batches of 1,000 rows per
+trial, medians of 3 trials; two launches per cell). Baseline is v3.12.0; "constraint optimization" is memgraph#4769;
+"WAL optimization" is this branch with `lockfree-read-snapshot,pipelined-commit` on top of #4769. Milliseconds per
+transaction throughout.
 
-Quiet round, 96 batches per trial (latencies and CPU in milliseconds per transaction):
+| Writers | Tx p50 baseline | after constraint optimization | after WAL optimization | CPU per tx baseline | after constraint optimization | after WAL optimization |
+|---|---|---|---|---|---|---|
+| 1 | 13.3 / 13.3 | 8.6 / 8.3 | 7.0 / 7.6 | 14.0 / 13.5 | 9.2 / 8.5 | 7.3 / 7.9 |
+| 12 | 56.5 / 53.9 | 17.5 / 13.1 | 10.2 / 8.8 | 61.5 / 60.0 | 17.7 / 13.3 | 9.4 / 9.2 |
 
-| Launch | Writers | tx/s | CPU ms/tx | p50 ms | p99 ms |
-|---|---|---|---|---|---|
-| base, lockfree-read-snapshot | 1 | 64.2 | 15.52 | 15.2 | 25.7 |
-| | 4 | 118.6 | 24.58 | 32.6 | 48.5 |
-| | 8 | 99.4 | 30.10 | 62.3 | 174.1 |
-| | 12 | 94.6 | 32.29 | 96.5 | 253.6 |
-| this branch, lockfree-read-snapshot | 1 | 76.3 | 13.23 | 12.5 | 22.5 |
-| | 4 | 122.9 | 23.02 | 29.5 | 48.4 |
-| | 8 | 112.7 | 27.29 | 57.7 | 131.7 |
-| | 12 | 101.0 | 30.21 | 89.4 | 288.4 |
-| this branch, lockfree-read-snapshot + pipelined-commit | 1 | 86.2 | 11.56 | 11.1 | 20.4 |
-| | 4 | 159.6 | 13.33 | 23.8 | 32.7 |
-| | 8 | 131.9 | 14.90 | 56.7 | 78.7 |
-| | 12 | 115.9 | 16.56 | 98.1 | 115.6 |
+The same binary with the flags off measures 7.0 / 7.2 ms (1 writer) and 12.1 / 12.9 ms (12 writers) p50, so the
+12-writer gain is the pipeline's: 12.5 to 9.5 ms p50, 14.3 to 9.3 ms CPU per transaction, 635 to 830 tx/s, p99
+26 to 16 ms. With one writer the flag changes nothing, as designed. Counters: every measured transaction was
+encoded outside the serializer, 0 budget fallbacks, 0 two-phase fallbacks.
 
-Shorter 48-batch trials on the same box gave the same shape (4 writers: 157.0 tx/s lock-free vs 177.5 pipelined;
-8 writers: 136.2 vs 161.5; 12 writers: 135.6 vs 148.8; server CPU per transaction 18.5 to 24.6 ms vs 12.7 to
-15.0 ms; p99 42 to 218 ms vs 34 to 87 ms). The box is shared, so single-writer numbers varied by up to 30% between
-rounds; the multi-writer gap and the CPU-per-transaction drop held in every round. With the flag off the branch
-matches the base within noise.
+Production instance (5-minute in-pod windows, upsert batches of up to 1,000 rows from 2 and 12 writer pods):
 
-Counters after the pipelined launch: `pipelined_commit_budget_fallbacks` 0, `pipelined_commit_two_pc_fallbacks` 0.
+| Writer pods | MAIN cores baseline | after constraint optimization | after WAL optimization | Tx p50 baseline | after constraint optimization | after WAL optimization | Tx p90 baseline | after constraint optimization | after WAL optimization |
+|---|---|---|---|---|---|---|---|---|---|
+| 2 | 2.40 | 1.48 | 1.03 | 28 | 11 | 12 | 63 | 21 | 22 |
+| 12 | 5.18 | 1.97 | 1.30 | 81 | 24 | 16 | 277 | 140 | 53 |
 
 ## Tests
 
