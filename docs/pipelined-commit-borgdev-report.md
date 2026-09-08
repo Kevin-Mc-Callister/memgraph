@@ -7,17 +7,27 @@ Written 2026-09-08. Implements `docs/superpowers/plans/2026-09-07-memgraph-pipel
 
 | Item | Value |
 |---|---|
-| Implementation branch | `Kevin-Mc-Callister/memgraph` `pipelined-commit`, head `HEAD_SHA` |
+| Implementation branch | `Kevin-Mc-Callister/memgraph` `pipelined-commit`, head `fa0713f4b` |
 | Base | `master` at `be32bab6bebef32c8d1eafb4420fe8f6221dd5ba`, merged with memgraph#4777 head `cd7a8f8814617eab2357da203cd81a28a090908b` (clean merge, no conflicts) |
-| Integration branch | `borgdev-integration` = `pipelined-commit` + memgraph#4769 (`skip-unique-verification-for-unrelated-properties`, `c8ff27f1aaba`), head `INTEGRATION_SHA` |
-| Image | `docker.io/transparapull/memgraph-dev:2`, digest `IMAGE_DIGEST` |
+| Integration branch | `borgdev-integration` = `pipelined-commit` + memgraph#4769 (`skip-unique-verification-for-unrelated-properties`, `c8ff27f1aaba`), head `496421a88` (the deployed image was built one merge earlier at `e573cf9e8`; the difference is the last review commit, which changes only the test-only park bound, a cached hooks pointer and the spec text) |
+| Image | `docker.io/transparapull/memgraph-dev:2`, digest `sha256:8490353f7eb3a37da0649a8c0c2567257f314a8c312f380938d8bede05852e04`, built from `borgdev-integration` at `e573cf9e8` (`memgraph version 3.13.0+36~e573cf9e8b58`) over `memgraph/memgraph:3.12.0` with the toolchain-v8 `libstdc++.so.6.0.36`/`libgcc_s.so.1`, `libpython3.11` and `/usr/lib/python3.11` from the build container; Dockerfile in `~/scratchpad/mg-pipeline-image/` on the build host |
 | Binary version | `memgraph version 3.13.0+…` from the master-based tree; durability format `kVersion = 37` (v3.12.0 writes 36) |
 | Build container | `mgpatch2`, tree `/home/mg/memgraph-pipeline` (toolchain v8 installed at `/opt/toolchain-v8`) |
 | No GitHub pull request was opened | PR text drafted in `docs/pipelined-commit-upstream-pr.md` |
 
 Commits on `pipelined-commit` (oldest first):
 
-COMMIT_LIST
+- `a8e36a588` Merge feat/adaptive-commit-lock-scheduling (memgraph#4777) as the pipelined-commit base
+- `6d45d6383` chore: restore opt-in default for lockfree-read-snapshot (local, not for upstream)
+- `f642896be` docs(specs): pipelined commit experiment; bench: writer sweep (Task 0)
+- `fe13b0365` feat(durability): budget-charged in-memory BaseEncoder with WAL-identical layout and CRC (Task 1)
+- `4d6bfcf4b` feat(storage): ordered commit gate and owning commit ticket (Task 3)
+- `1783f77ba` feat(durability): encode a transaction to a private buffer and append it verbatim (Task 2)
+- `c54b4bc97` feat(storage): pipelined commit: encode the WAL outside the commit serializer (Tasks 4, 5, 6)
+- `3caa949bf` test(storage): pipelined commit ordering on replicas, under crashes, and under worker saturation (Task 7)
+- `01993ae7b` docs: base pin and citation notes for the pipelined-commit branch
+- `fe7eecb4b` review: address the Opus reviews of the pipelined-commit tasks
+- `fa0713f4b` review: bound the test-only encode-stage park and resolve the test hooks once (Task 9 documents landed with this and the previous commit)
 
 ## What was implemented
 
@@ -34,18 +44,32 @@ plan for the design; `docs/pipelined-commit-base-notes.md` maps the plan's citat
 | storage_v2_commit_order_gate (new) | 6 passed |
 | storage_v2_wal_file | 87 passed, 5 skipped (81 + 6 new; skips unchanged from the base) |
 | storage_v2_pipelined_commit (new) | 27 passed |
-| storage_v2_replication | 41 passed (23 + 18 new, including the process-isolated two-replica cases) |
+| storage_v2_replication | 44 passed (23 + 21 new, including the process-isolated two-replica cases) |
 | storage_v2_durability_inmemory | 161 passed (158 + 3 new crash-resilience instances) |
 | storage_v2_lockfree_read_snapshot | 27 passed |
 | storage_v2_constraints | 87 passed, 29 skipped (unchanged) |
 | utils_priority_thread_pool | 28 passed (27 + 1 new) |
 
-Assertion-enabled build (`build-asserts`, memgraph's own code compiled without `NDEBUG` on the Release conan
-dependencies; a full Debug dependency set did not fit the 21 GB of free disk): buffer encoder 5, gate 6, wal_file
-87, pipelined_commit 27, replication 41, all passed. The Release build covers the plan's NDEBUG requirement for
+These results are from the review commit (`fe7eecb4b`). Assertion-enabled build (`build-asserts`, memgraph's own
+code compiled without `NDEBUG` on the Release conan dependencies; a full Debug dependency set did not fit the 21 GB
+of free disk), run before the review commit: buffer encoder 5, gate 6, wal_file 87, pipelined_commit 27,
+replication 41, all passed. The Release build covers the plan's NDEBUG requirement for
 test 10 and the rotation test.
 
-FULL_SWEEP
+### Full storage sweep
+
+Plan Task 8 step 4, every unit suite whose name matches
+`storage_v2|durability|replication|skip_list|constraint|property_store|delta|gc|snapshot|wal|vertex|edge|lockfree|pipelined|commit_order|buffer_encoder`
+(49 suites; `storage_v2_retention.` is registered under a name with a trailing dot upstream and was skipped as
+unknown): 48 of 49 passed on the first pass; `storage_v2_durability_inmemory` reported two light-edge description
+failures in that pass because the integration tree's copy of the same suite was running at the same time on the
+same fixed temp directory. Rerun alone it passes all 161 (on both trees). Skip counts are unchanged from the base
+(constraints 29, wal_file 5, indices 53, schema_info 2). Logs: `/home/mg/logs/sweep_branch.log` in the container.
+
+Integration tree (`borgdev-integration`): constraints 103 passed / 29 skipped (the 16 instances of #4769's eight
+`UniquePropertyTrackingTest` cases, parameterized over `--storage-delta-on-identical-property-update`, included),
+buffer encoder 5, gate 6, wal_file 87 (5 skipped), pipelined_commit 27, replication 44, lockfree 27,
+durability_inmemory 161 (rerun alone; the concurrent first pass hit the same temp-directory collision).
 
 ### OFF identity
 
@@ -167,6 +191,24 @@ Opus reviewers ran per task (spec compliance, then quality) and over the whole d
   `dynamic_cast` in `FinalizeTransaction`; `AbortTwoPcOrTerminate` guards `FinalizeWalFile` with `if (wal_file_)`
   like the base's own 2PC arm.
 
+### Whole diff against the plan's Design section (Opus): ship-able, no blocking defect
+
+- The reviewer traced INV-ORDER, INV-PUBLISH, INV-UNIQUE and INV-ONE-DOMAIN on every path (pipeline, ordered
+  legacy, budget fallback, borrowed 2PC fallback, rotation, epoch change), the exactly-once retirement on all nine
+  exit paths, the three sanctioned termination points, deadlock freedom at the gate and the five quiescence sites
+  (the maintenance pool and the replica worker pool are different pools), the budget charge/release pairing, the
+  owner-only stream discard, and the flag-off path, and found no violation.
+- SHOULD-FIX, accepted: the test-only `MG_TEST_PIPELINED_S2_PARK_FIFO` park holds a ticket; it now gives up after
+  60 seconds with a warning so a stray environment variable cannot stall every later commit and quiescence.
+- SHOULD-FIX, accepted in part: `TransactionReplication` now resolves the storage's test hooks once at
+  construction (one `dynamic_cast` per commit instead of three); the relaxed atomic increment of
+  `finalize_wal_calls` on every commit stays (the plan asks for the counter).
+- Notes recorded in the spec: quiescence now drains the whole gate, including the timed heartbeat reconciliation;
+  a STRICT_SYNC replica makes every eligible commit encode twice (2PC is only known once streams open, as the plan
+  designed it; a pre-S2 check from the clients' modes is a possible follow-up). Noted, no change: shutdown's
+  `repl_storage_state_.Reset()` still precedes the quiesce (unchanged from the base); the lockfree-only shutdown
+  now takes `commit_mutex_` where the base took nothing (harmless).
+
 ### Tasks 4-7, quality (Opus): four blocking test-robustness findings, all fixed
 
 - BLOCKING, fixed: assertions returning over a live committer thread in the mixed STRICT_SYNC + ASYNC tests
@@ -194,6 +236,13 @@ Opus reviewers ran per task (spec compliance, then quality) and over the whole d
 - Notes recorded: the `bad_alloc` fallback does not count as a budget fallback (the plan increments only on
   refusal); `on_commands_released` fires for both scopes on a fallback (tests filter by scope).
 
+### Integration merge (Opus)
+
+`pipelined-commit..borgdev-integration` is byte-identical to `#4769`'s own diff minus the benchmark script (which
+the implementation branch already carried in its extended form): the merge adds only #4769. The reviewer also
+checked that #4769 changes only which vertices enter the unique-constraint verification set, never when the set is
+validated, so it does not interact with the ordered validation.
+
 The fixture's new exit-status check also surfaced a real teardown defect: a replica quitting with a prepared
 transaction still cached in the static 2PC slot crashed at static destruction; the replica role now aborts it
 before tearing down.
@@ -201,11 +250,71 @@ before tearing down.
 
 ## borgdev
 
-BORGDEV_SECTION
+Cluster state found (2026-09-08 18:20 UTC): StatefulSet at 1 replica on `memgraph-dev:1`, pod `tgraph-db-memgraph-0`
+labelled `role=main`, `tgraph-controller` at 0, `tgraph-event` at 2. dk8s1 had rebooted at 14:34 UTC; the
+tgraph-event pods had lost their MQTT connection in that reboot and never reconnected (EMQX listed no tgraph-event
+client; no attribute value had been written since 09:23 UTC, five hours before the reboot). I restarted
+`deploy/tgraph-event` (still 2 replicas) at 18:33 UTC; both pods reconnected and drained their backlog.
+
+| Step | Result |
+|---|---|
+| StatefulSet spec saved | `~/sts-before-202609081840.yaml` on dk8s1 |
+| Backup | `CREATE SNAPSHOT` at 18:50 UTC, then the newest snapshot (`20260908185019036234_timestamp_1703315487`, 1.73 GB) plus the `wal/` directory streamed to `~/mg_data_backup_202609081850.tgz` on dk8s1 (290 MB compressed). Full `mg_data` was 11 GB (three snapshots); the newest snapshot plus WAL is what a restore needs. |
+| Patch | one JSON patch at 18:51:51 UTC: image `registry-1.docker.io/transparapull/memgraph-dev:2`, args unchanged plus `--experimental-enabled=lockfree-read-snapshot,pipelined-commit` |
+| Restart | pod pending at 18:52:19, recovery finished and ready at 18:54:20 UTC (two minutes; 4.58 M vertices, 5.80 M edges) |
+| Re-label | `role=main` at 18:54:50 UTC; the Service endpoint returned; tgraph-event logged connection errors only during the 18:52 to 18:54 window (one "flush of 1000 msgs failed" per pod during the restart, the same behaviour as any Memgraph restart) and none afterwards |
+| Counters | `pipelined_commit_s2_encodes` 114 one minute after the relabel, 398 after twelve minutes; `budget_fallbacks` 0; `two_pc_fallbacks` 0; `gate_wait_ns` 83 ms and `s3_ns` 245 ms cumulative over those 398 commits |
+| Health | no critical or error lines in the Memgraph log after start-up (the `nxalg`/`graph_analyzer`/`wcc` networkx module errors are the known harmless ones); restart count 0 |
+
+Five-minute in-pod measurements (`measure_phase.py`), both with 2 tgraph-event pods:
+
+| Window | MAIN cores | upsert transactions | p50 / p90 / max ms | newest value lag | values with source ts in last 15 s |
+|---|---|---|---|---|---|
+| before, `memgraph-dev:1`, 18:34 to 18:39 UTC (right after the tgraph-event restart) | 0.83 | 12 (2 per minute) | 3 / 4 / 5 | 20.5 s | 0 |
+| after, `memgraph-dev:2` + pipelined-commit, 18:55 to 19:00 UTC | 0.70 | 20 (4 per minute) | 4 / 11 / 21 | 11.6 s | 1,474 |
+
+The write load on borgdev right now is a few upserts per minute (the earlier reference points were taken with
+12 tgraph-event pods and a full interface fleet), so these windows show the pipeline running correctly in
+production (every eligible commit encoded outside the serializer, zero fallbacks, fresh values, no errors) but
+cannot show the multi-writer ceiling; the ceiling measurement is the local Task 8 sweep above. Pipelined commits
+are happening: `s2_encodes` climbs with every upsert and `budget_fallbacks` stays at 0.
+
+Rollback, if needed: `kubectl -n transpara set image sts/tgraph-db-memgraph memgraph=registry-1.docker.io/transparapull/memgraph-dev:1`,
+remove the `--experimental-enabled` arg (or apply `~/sts-before-202609081840.yaml`'s template), re-label the pod
+`role=main`; because this binary writes durability format 37, restore `~/mg_data_backup_202609081850.tgz` into
+the PVC (`/var/lib/memgraph/mg_data/snapshots/` and `wal/`) before starting `memgraph-dev:1`.
 
 ## Deviations from the plan and the handoff
 
-DEVIATIONS
+- **Toolchain.** The plan's build recipe assumed the container's toolchain v7; `master` (and the plan's own base
+  commit) require toolchain v8, which was downloaded into the container. `gperf` was missing as an OS dependency
+  and installed.
+- **Commit granularity.** Tasks 1, 3 and 2 are separate commits (Task 2's `storage.cpp`/`storage.hpp` part was
+  regenerated by replaying its edits on the committed base so the commit compiles standalone, which was verified
+  in a second worktree). Tasks 4, 5 and 6 landed in one commit: the dispatch, the ticketed legacy path and the
+  pipelined branch are one edit of `PrepareForCommitPhase`, and the plan's Task 4 tests only compile against the
+  Task 5/6 code. Task 7 is its own commit; the review fixes are one more.
+- **Task 4 flag tests** live in `storage_v2_pipelined_commit.cpp` (there is no flags unit suite).
+- **Task 6 test 9c** (partial replication-object construction) and the two-replica variants of 3b use two SYNC
+  replicas in one process: a SYNC prepare stores no accessor in the static 2PC cache, and the existing upstream
+  suite already runs two SYNC replicas in one process. Every test with a STRICT_SYNC second replica (8, 9e, the
+  between-frames death) uses the process-isolated fixture as the plan requires.
+- **Debug build.** A full Debug dependency set did not fit the container's free disk (21 GB); the assertion
+  coverage came from a second build tree that compiles memgraph's own sources without `NDEBUG` against the
+  Release dependencies. The plan's NDEBUG requirement is covered by the Release tree.
+- **Task 7 end-to-end test** is a manual script (`tests/manual/pipelined_commit_worker_liveness.py`) driving a
+  real server, rather than a workload in the `tests/e2e` framework; it exercises what the plan lists (16 Bolt
+  writers, a parked head released out of band, a 17th reader, PERIODIC COMMIT, a before-commit trigger). It needed
+  a small test-only environment hook in the storage (`MG_TEST_PIPELINED_S2_PARK_FIFO` / `_SKIP`).
+- **Task 8** ran with 48 and 96 batches per trial (the benchmark's `--batches` limit is 100 with 100,000 vertices)
+  rather than the benchmark's default 48 only; the box is shared and noisy, so the three key configurations were
+  repeated.
+- **Task 9** is the document `docs/pipelined-commit-upstream-pr.md`; no issue or pull request was opened.
+- **borgdev.** The tgraph-event pods had lost their MQTT connection during the node reboot at 14:34 UTC and never
+  reconnected (EMQX listed no tgraph-event client; no attribute value had been written since 09:23 UTC). I
+  restarted the `tgraph-event` deployment (2 replicas, unchanged count) before measuring; nothing else in the
+  cluster was touched beyond what the handoff lists.
+
 
 ## Left for Kevin
 
