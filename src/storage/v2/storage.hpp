@@ -12,6 +12,8 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -124,6 +126,7 @@ class ReadOnlyAccessTimeout : public utils::BasicException {
 
 struct Transaction;
 class EdgeAccessor;
+struct CommitProbe;
 
 // TODO: list status Populating/Ready
 struct IndicesInfo {
@@ -309,6 +312,9 @@ class Storage {
 
   void SetBroken(bool value) noexcept { broken_.store(value, std::memory_order_release); }
 
+  // Test-only: install commit-path instrumentation (lock-free-read-snapshot experiment). Null in production.
+  void SetCommitProbe(CommitProbe *probe) noexcept { commit_probe_ = probe; }
+
   memory::ArenaPool *DbArenaPool() const noexcept { return db_arena_pool_; }
 
   using Accessor = memgraph::storage::Accessor;
@@ -372,6 +378,27 @@ class Storage {
   std::unique_ptr<Accessor> ReadOnlyAccess(std::optional<IsolationLevel> override_isolation_level);
   std::unique_ptr<Accessor> ReadOnlyAccess();
 
+  /// Handle for a single in-flight non-blocking BEGIN attempt.  Encapsulates the pending-scope
+  /// registration (for UNIQUE / READ_ONLY) so the query layer never touches main_lock_ directly.
+  struct PendingAccess {
+    virtual ~PendingAccess() = default;
+    /// Returns the built accessor if main_lock_ now admits the requested mode, else nullptr
+    /// (still registered pending — call again on the next wake). Never blocks, never throws.
+    virtual std::unique_ptr<Accessor> TryAcquire(std::optional<IsolationLevel> override_isolation_level) = 0;
+  };
+
+  /// Returns a PendingAccess for non-blocking BEGIN retry, or nullptr when the storage backend does
+  /// not support non-blocking acquisition (DiskStorage keeps this default → caller must block).
+  virtual std::unique_ptr<PendingAccess> MakePendingAccess(StorageAccessType /*rw_type*/) { return nullptr; }
+
+  /// Non-blocking single-probe accessor acquisition: returns the accessor if main_lock_ admits the
+  /// mode right now, else nullptr. Grants no priority (one probe). DiskStorage keeps this default
+  /// (no probe → a poller learns to block instead of spinning); InMemoryStorage overrides it.
+  virtual std::unique_ptr<Accessor> TryAccess(StorageAccessType /*rw_type*/,
+                                              std::optional<IsolationLevel> /*override_isolation_level*/ = {}) {
+    return nullptr;
+  }
+
   enum class SetIsolationLevelError : uint8_t { DisabledForAnalyticalMode };
 
   std::expected<void, SetIsolationLevelError> SetIsolationLevel(IsolationLevel isolation_level);
@@ -390,6 +417,15 @@ class Storage {
   virtual Transaction CreateTransaction(IsolationLevel isolation_level, StorageMode storage_mode) = 0;
 
   virtual void PrepareForNewEpoch() = 0;
+
+  // EXPERIMENTAL (lock-free-read-snapshot). Only meaningful when the experiment is ON.
+  // Returns an owning lock on success, a non-owning (empty) lock when another committer holds it.
+  [[nodiscard]] std::unique_lock<std::mutex> TryCommitLock() noexcept {
+    return std::unique_lock<std::mutex>{commit_mutex_, std::try_to_lock};
+  }
+
+  // True iff the lock-free read-snapshot experiment is ON for this storage instance.
+  bool IsCommitSerialised() const noexcept { return config_.experimental_lockfree_read_snapshot; }
 
   auto GetReplicaState(std::string_view name) const -> std::optional<replication::ReplicaState> {
     return repl_storage_state_.GetReplicaState(name);
@@ -438,6 +474,24 @@ class Storage {
   // creation.
   mutable utils::ResourceLock main_lock_;
 
+  // Install-once hook; fires WakeMatching({MainLock}) from ResourceLock::maybe_notify.
+  // Cleared before pool destruction (memgraph.cpp ForEach) so no notify reaches a dead pool.
+  std::atomic<bool> main_lock_hook_installed_{false};
+
+  bool MainLockHookInstalled() const noexcept { return main_lock_hook_installed_.load(std::memory_order_acquire); }
+
+  // Install once; a second call is a no-op (returns false). The exchange closes the
+  // load→install race between concurrent first-BEGINs on the same DB.
+  bool TrySetMainLockNotifyHook(std::move_only_function<void()> hook) {
+    if (main_lock_hook_installed_.exchange(true, std::memory_order_acq_rel)) return false;
+    main_lock_.SetNotifyHook(std::move(hook));
+    return true;
+  }
+
+  // Disarm for shutdown. Does NOT reset main_lock_hook_installed_: re-arming would open a window
+  // for a second SetNotifyHook to overwrite on_notify_all_storage_ under an in-flight reader.
+  void ClearMainLockNotifyHook() { main_lock_.ClearNotifyHook(); }
+
   // Even though the edge count is already kept in the `edges_` SkipList, the
   // list is used only when properties are enabled for edges. Because of that we
   // keep a separate count of edges that is always updated. This counter is also used
@@ -454,6 +508,17 @@ class Storage {
   mutable utils::SpinLock engine_lock_;
   uint64_t timestamp_{kTimestampInitialId};
   uint64_t transaction_id_{kTransactionInitialId};
+
+  // EXPERIMENTAL (lock-free-read-snapshot). All three are inert when the experiment is OFF.
+  // Serializes committers across mint->durability->publish and (in that mode) guards the WAL group;
+  // acquired only on the experiment's ON path, so the OFF path is byte-for-byte unchanged.
+  mutable std::mutex commit_mutex_;
+  // Runtime-only watermark: the last fully-published commit timestamp. Advanced at publish on the ON
+  // path, seeded from recovered max commit ts on startup. NEVER persisted (durable data is flag-independent).
+  std::atomic<uint64_t> last_committed_mvcc_ts_{kTimestampInitialId};
+  // Test-only instrumentation (null in production). Set by tests to pin the commit path at phase
+  // boundaries. Forward-declared to keep this header light; defined in storage/v2/commit_probe.hpp.
+  CommitProbe *commit_probe_{nullptr};
 
   // Written under a UNIQUE hold on main_lock_. UNIQUE excludes all three shared modes, so any hold
   // pins both values for its life, and releasing one un-pins them: a reader that reacquires must
@@ -532,6 +597,9 @@ inline std::ostream &operator<<(std::ostream &os, StorageAccessType type) {
   }
   return os;
 }
+
+/// Throws UniqueAccessTimeout, ReadOnlyAccessTimeout, or SharedAccessTimeout for the given mode.
+[[noreturn]] void ThrowAccessTimeout(StorageAccessType rw_type);
 
 /// Acquires `main_lock_` in the mode `rw_type` names. Blocks indefinitely without a timeout; with
 /// one, throws the timeout exception belonging to that mode.
@@ -803,7 +871,10 @@ class Accessor {
   virtual void DropAllConstraints() = 0;
 
   // NOLINTNEXTLINE(google-default-arguments)
-  virtual std::expected<void, StorageManipulationError> PrepareForCommitPhase(CommitArgs commit_args) = 0;
+  // preheld_commit_lock: owning lock pre-acquired by the caller via TryLockCommit(); adopted here.
+  // Default-constructed (non-owning) = no pre-held guard; implementation acquires blocking.
+  virtual std::expected<void, StorageManipulationError> PrepareForCommitPhase(
+      CommitArgs commit_args, std::unique_lock<std::mutex> preheld_commit_lock = {}) = 0;
 
   // NOLINTNEXTLINE(google-default-arguments)
   virtual std::expected<void, StorageManipulationError> PeriodicCommit(CommitArgs commit_args) = 0;
@@ -811,6 +882,13 @@ class Accessor {
   virtual void Abort() = 0;
 
   virtual void FinalizeTransaction() = 0;
+
+  // EXPERIMENTAL (lock-free-read-snapshot) helpers for the parkable-commit path.
+  bool IsCommitSerialised() const noexcept { return storage_->IsCommitSerialised(); }
+
+  // Must not be called on the OFF path: commit_mutex_ is never taken there, so the try always
+  // succeeds (harmless but wasteful); gate the call with IsCommitSerialised().
+  [[nodiscard]] std::unique_lock<std::mutex> TryLockCommit() noexcept { return storage_->TryCommitLock(); }
 
   // Stable per-query id; preserved across PERIODIC COMMIT.
   std::optional<uint64_t> GetStartTimestamp() const;

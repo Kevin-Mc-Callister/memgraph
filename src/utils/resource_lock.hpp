@@ -10,8 +10,10 @@
 // licenses/APL.txt.
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -130,7 +132,12 @@ struct ResourceLock {
 
   void maybe_notify(std::unique_lock<std::mutex> &lock, NotifyKind kind) {
     lock.unlock();
-    if (kind == NotifyKind::All) cv.notify_all();
+    if (kind == NotifyKind::All) {
+      cv.notify_all();
+      // Fired off `mtx` (already unlocked above) so the hook may take an unrelated lock without a
+      // lock-order inversion. acquire pairs with the release in SetNotifyHook: storage_ is visible.
+      if (auto *h = on_notify_all_.load(std::memory_order_acquire)) (*h)();
+    }
   }
 
   /// Acquires in mode `Req`, `wait` supplying the wait strategy. Requires `lock` to own mtx; leaves
@@ -239,6 +246,18 @@ struct ResourceLock {
 
   void unlock() { release<LockReq::UNIQUE>(); }
 
+  /// Installs a callback fired after the internal mtx is released on every NotifyKind::All, intended
+  /// to wake parked schedulers. Install at most once per lifetime (exchange-guarded at the Storage
+  /// level); clear before pool destruction. release/acquire makes the callable visible off-mtx.
+  void SetNotifyHook(std::move_only_function<void()> hook) {
+    on_notify_all_storage_ = std::move(hook);
+    on_notify_all_.store(on_notify_all_storage_ ? &on_notify_all_storage_ : nullptr, std::memory_order_release);
+  }
+
+  /// Disarms the hook: in-flight maybe_notify readers that loaded the old pointer still dereference
+  /// valid storage_ (never freed until ~ResourceLock, which runs after all lock activity has ceased).
+  void ClearNotifyHook() { on_notify_all_.store(nullptr, std::memory_order_release); }
+
   template <LockReq Req = LockReq::WRITE>
     requires(Req != LockReq::UNIQUE)
   void lock_shared() {
@@ -294,6 +313,10 @@ struct ResourceLock {
   // Callers waiting to acquire UNIQUE (blocking lock()/try_lock_for(), or a UniquePendingScope
   // campaign). Gates new shared acquisitions for writer-preference; see can_acquire.
   uint32_t unique_pending_count = 0;
+  // release/acquire so maybe_notify can load the pointer off-mtx without a data race; storage_
+  // survives ClearNotifyHook so in-flight readers that hold the old pointer stay safe.
+  std::move_only_function<void()> on_notify_all_storage_;
+  std::atomic<std::move_only_function<void()> *> on_notify_all_{nullptr};
 };
 
 struct SharedResourceLockGuard {
