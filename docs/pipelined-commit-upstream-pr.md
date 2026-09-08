@@ -3,14 +3,47 @@
 Pull-request text. The implementation sits on top of `feat/adaptive-commit-lock-scheduling` (memgraph#4777), which
 is not merged; the base branch is that head merged into `master`.
 
-## Problem
+## What this is, in plain terms
 
-With `lockfree-read-snapshot` a main-side commit holds the commit serializer (`commit_mutex_`) from the mint through
-durability, replication and publication. Unique-constraint validation and the read watermark both need commits to
-become visible in mint order, so the serializer cannot simply be released earlier. The serial section therefore
-contains work that is not order-sensitive at all: encoding every delta of the transaction into WAL bytes. For a
-1,000-row batch on a production instance roughly 26 of 41 ms are serialized and the largest single piece is the
-encoding of about 8,000 deltas. Adding writers adds queueing, not throughput.
+Today a Memgraph commit does three things while holding one lock (`commit_mutex_`): it hands out the commit
+timestamp, it turns every change the transaction made into bytes and writes them to the write-ahead log (and sends
+the same bytes to replicas), and it makes the transaction visible. Because the lock is held for all three, two
+writers can never encode at the same time; the second one waits for the first to finish writing its log. For a
+1,000-row upsert most of the time under that lock is spent producing the log bytes, so adding writers only adds
+queueing.
+
+Postgres solved the same problem long ago: a backend builds its WAL record in its own memory first, then takes a
+short lock only to reserve a position in the log and copy the finished bytes in, and commit visibility is a
+separate, ordered step. The log stays in order because positions are handed out in order, not because one
+transaction at a time is allowed to do all of its work.
+
+This change borrows that shape. With `--experimental-enabled=pipelined-commit`, a commit now:
+
+1. takes the lock only long enough to get its timestamp and a ticket in the commit queue;
+2. releases the lock and encodes its changes into a private buffer, in parallel with other committers;
+3. waits for its ticket to come up, and only then checks unique constraints, copies the finished buffer into the
+   log in one write, replicates, and becomes visible.
+
+Nothing about what ends up in the log changes: the buffer is byte-for-byte what the old inline path would have
+written, checksum included, and a harness proves the flag-off path still writes identical files. Replication,
+two-phase commit and constraint checking are the existing code, just executed in ticket order. Transactions that
+do not fit the fast path (index changes, storages without a log, commits that need two-phase commit, commits that
+would exceed a memory budget) take the same ticket and run the old code after their turn comes, so every commit is
+still ordered by one mechanism.
+
+The flag is off by default and requires `lockfree-read-snapshot`, whose three-phase commit this builds on. The
+constraint optimization in memgraph#4769 (skip unique-constraint bookkeeping for properties no constraint covers)
+is independent and is the "after constraint optimization" column in the tables below.
+
+## How big a change is it
+
+About 1,800 lines of production code across 28 files, 4,100 lines of tests, and 640 lines of docs. Roughly half
+the production code is new, self-contained pieces (a buffer encoder, a commit-order gate and ticket, a memory
+budget); the other half is the commit path in `inmemory/storage.cpp` and the replication object, where the
+existing durability continuation was moved under a ticket rather than rewritten. It touches the most sensitive
+path in the storage engine, which is why the failure protocol (what happens when something throws between "log
+bytes written" and "visible") takes up most of the design and most of the tests. It changes no file format, no
+wire format and no query surface beyond the flag, the budget flag and five counters.
 
 ## Design
 
@@ -26,13 +59,6 @@ in three stages:
 | S1 mint | `commit_mutex_`; `engine_lock_` briefly | mint the commit timestamp, register a `CommitTicket` with the `CommitOrderGate`, release both locks |
 | S2 encode | accessor and transaction only | `MaterializeTxnCommands` (the existing traversal, extracted whole), `EncodeTxnCommandsTo` into a private, CRC-complete `TxnWalBuffer` through a budget-charging allocator |
 | S3 ordered | gate ticket; `engine_lock_` only inside publish | `gate.Enter(ts)`, unique validation, `InitializeWalFile`, replication streams open, `AppendEncodedTransaction` (verbatim), `FinalizeWalFile`, ship, `FinalizeCommitPhase`, retire the ticket |
-
-Only the WAL encoding leaves the serial section. Replication, publication and two-phase commit are the existing code
-run in ticket order. Commits that are not eligible (metadata transactions, WAL-less storages, commits that turn out to
-need 2PC because a STRICT_SYNC replica is registered, over-budget commits) take the same ticket and run the existing
-durability code after entering the gate (`OrderedLegacyCommit`), so every main-side minted commit belongs to one
-ordering domain. Replica-side writes never take a ticket: the replication server applies them on one thread in
-main's order already.
 
 Invariants kept:
 
@@ -83,8 +109,9 @@ Refusal never blocks: it converts the commit into the ordered legacy path after 
 
 Local (16-core box, WAL on, `--storage-delta-on-identical-property-update=false`, the writer sweep from
 `tests/manual/unique_constraint_property_update_bench.py`: 100,000 Node/Value pairs, 48 batches of 1,000 rows per
-trial, medians of 3 trials; two launches per cell). Baseline is v3.12.0; "constraint optimization" is memgraph#4769;
-"WAL optimization" is this branch with `lockfree-read-snapshot,pipelined-commit` on top of #4769. Milliseconds per
+trial, medians of 3 trials; two launches per cell). Baseline is v3.12.0; "after constraint optimization" is
+v3.12.0 plus memgraph#4769 (skip unique-constraint verification for unrelated property writes); "after WAL
+optimization" is this branch with `lockfree-read-snapshot,pipelined-commit` on top of #4769. Milliseconds per
 transaction throughout.
 
 | Writers | Tx p50 baseline | after constraint optimization | after WAL optimization | CPU per tx baseline | after constraint optimization | after WAL optimization |
@@ -97,7 +124,8 @@ The same binary with the flags off measures 7.0 / 7.2 ms (1 writer) and 12.1 / 1
 26 to 16 ms. With one writer the flag changes nothing, as designed. Counters: every measured transaction was
 encoded outside the serializer, 0 budget fallbacks, 0 two-phase fallbacks.
 
-Production instance (5-minute in-pod windows, upsert batches of up to 1,000 rows from 2 and 12 writer pods):
+Production instance (5-minute in-pod windows, upsert batches of up to 1,000 rows from 2 and 12 writer pods; the
+same three builds as above, #4769 being the constraint optimization):
 
 | Writer pods | MAIN cores baseline | after constraint optimization | after WAL optimization | Tx p50 baseline | after constraint optimization | after WAL optimization | Tx p90 baseline | after constraint optimization | after WAL optimization |
 |---|---|---|---|---|---|---|---|---|---|
