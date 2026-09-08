@@ -50,11 +50,21 @@ plan for the design; `docs/pipelined-commit-base-notes.md` maps the plan's citat
 | storage_v2_constraints | 87 passed, 29 skipped (unchanged) |
 | utils_priority_thread_pool | 28 passed (27 + 1 new) |
 
-These results are from the review commit (`fe7eecb4b`). Assertion-enabled build (`build-asserts`, memgraph's own
-code compiled without `NDEBUG` on the Release conan dependencies; a full Debug dependency set did not fit the 21 GB
-of free disk), run before the review commit: buffer encoder 5, gate 6, wal_file 87, pipelined_commit 27,
-replication 41, all passed. The Release build covers the plan's NDEBUG requirement for
-test 10 and the rotation test.
+These results are from the review commit (`fe7eecb4b`). The Release build covers the plan's NDEBUG requirement
+for test 10 and the rotation test.
+
+Correction (2026-09-08, after the Codex review): the `build-asserts` tree described earlier as "compiled without
+`NDEBUG`" was not. Memgraph's `CMakeLists.txt` hard-codes `CMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG"`, which overrides
+the `-O1` cache setting the tree was configured with, so every earlier "assertion-enabled" run was a second Release
+build. The tree was rebuilt with `-DNDEBUG` stripped from its generated `build.ninja` (memgraph's own sources
+without `NDEBUG` on the Release conan dependencies; a full Debug dependency set still does not fit the free disk).
+On that build, with `DMG_ASSERT` and the debug arena-ownership check in `DbDeallocateBytes` live for the first time:
+buffer encoder 5, gate 6, wal_file 87 (+5 skipped), pipelined_commit 27, priority thread pool 28, lock-free read
+snapshot 27, constraints 87 (+29 skipped), replication 44, durability 161, all passed, and the liveness script
+passes against its `memgraph` binary. The first run of that build found one defect, in a test: the writer threads
+of `PipelinedWalDeathResilience` had no database arena scope, so their deltas were allocated in the threads'
+default jemalloc arenas and the scoped GC thread's ownership check terminated the child. Production writer threads
+always run under the interpreter's scope; the test now sets one per writer thread.
 
 ### Full storage sweep
 
@@ -301,7 +311,8 @@ the PVC (`/var/lib/memgraph/mg_data/snapshots/` and `wal/`) before starting `mem
   between-frames death) uses the process-isolated fixture as the plan requires.
 - **Debug build.** A full Debug dependency set did not fit the container's free disk (21 GB); the assertion
   coverage came from a second build tree that compiles memgraph's own sources without `NDEBUG` against the
-  Release dependencies. The plan's NDEBUG requirement is covered by the Release tree.
+  Release dependencies (see the correction under the unit-test results: that tree only lost `NDEBUG` after the
+  Codex review). The plan's NDEBUG requirement is covered by the Release tree.
 - **Task 7 end-to-end test** is a manual script (`tests/manual/pipelined_commit_worker_liveness.py`) driving a
   real server, rather than a workload in the `tests/e2e` framework; it exercises what the plan lists (16 Bolt
   writers, a parked head released out of band, a 17th reader, PERIODIC COMMIT, a before-commit trigger). It needed
