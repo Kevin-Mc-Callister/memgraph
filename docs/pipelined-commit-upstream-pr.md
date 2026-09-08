@@ -1,7 +1,8 @@
 # Pipelined commit: encode the WAL outside the commit serializer (experimental)
 
-Pull-request text. The implementation sits on top of `feat/adaptive-commit-lock-scheduling` (memgraph#4777), which
-is not merged; the base branch is that head merged into `master`.
+Pull-request text. Depends on memgraph#4777 (`feat/adaptive-commit-lock-scheduling`, the lock-free read snapshot),
+which is not merged; the base branch is that head merged into `master`. Measured together with memgraph#4769 (the
+unique-constraint optimization).
 
 ## What this is, in plain terms
 
@@ -31,9 +32,11 @@ do not fit the fast path (index changes, storages without a log, commits that ne
 would exceed a memory budget) take the same ticket and run the old code after their turn comes, so every commit is
 still ordered by one mechanism.
 
-The flag is off by default and requires `lockfree-read-snapshot`, whose three-phase commit this builds on. The
-constraint optimization in memgraph#4769 (skip unique-constraint bookkeeping for properties no constraint covers)
-is independent and is the "after constraint optimization" column in the tables below.
+The flag is off by default and requires `lockfree-read-snapshot` from memgraph#4777
+(`feat/adaptive-commit-lock-scheduling`, not yet merged), whose three-phase commit (mint, then durability with the
+engine lock released, then publish) this builds on; this branch is that head merged into `master`. The constraint
+optimization in memgraph#4769 (skip unique-constraint bookkeeping for properties no constraint covers) is
+independent and is the "after constraint optimization" column in the tables below.
 
 ## How big a change is it
 
@@ -48,8 +51,8 @@ wire format and no query surface beyond the flag, the budget flag and five count
 ## Design
 
 Flag `--experimental-enabled=pipelined-commit`, startup-only, off by default, valid only together with
-`lockfree-read-snapshot` (validated on the combined command-line plus environment mask, and again by the storage
-constructor). Budget `--storage-pipelined-commit-max-bytes` (default 256 MiB).
+`lockfree-read-snapshot` from memgraph#4777 (validated on the combined command-line plus environment mask, and again
+by the storage constructor). Budget `--storage-pipelined-commit-max-bytes` (default 256 MiB).
 
 An eligible main-side commit (in-memory transactional storage with a WAL, data deltas only, no metadata deltas) runs
 in three stages:
@@ -111,8 +114,8 @@ Local (16-core box, WAL on, `--storage-delta-on-identical-property-update=false`
 `tests/manual/unique_constraint_property_update_bench.py`: 100,000 Node/Value pairs, 48 batches of 1,000 rows per
 trial, medians of 3 trials; two launches per cell). Baseline is v3.12.0; "after constraint optimization" is
 v3.12.0 plus memgraph#4769 (skip unique-constraint verification for unrelated property writes); "after WAL
-optimization" is this branch with `lockfree-read-snapshot,pipelined-commit` on top of #4769. Milliseconds per
-transaction throughout.
+optimization" is this branch (memgraph#4777's lock-free read snapshot plus the pipelined commit) with
+`lockfree-read-snapshot,pipelined-commit` enabled, on top of #4769. Milliseconds per transaction throughout.
 
 | Writers | Tx p50 baseline | after constraint optimization | after WAL optimization | CPU per tx baseline | after constraint optimization | after WAL optimization |
 |---|---|---|---|---|---|---|
