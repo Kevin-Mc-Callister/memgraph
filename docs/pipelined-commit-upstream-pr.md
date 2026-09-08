@@ -74,7 +74,10 @@ Invariants kept:
 - Failure semantics are unchanged: partial WAL writes and fsync failures stay fatal, a SYNC replica failure still
   reports the transaction as committed, aborts never advance the read watermark.
 - The flag-off path is the same code; a deterministic harness (`tests/unit/storage_v2_off_identity.cpp`) run on the
-  base and on this branch produces byte-identical WAL files.
+  base and on this branch produces byte-identical WAL files, for the same `lockfree-read-snapshot` setting on both.
+  Note that the first commit on this branch restores the opt-in default for `lockfree-read-snapshot`, which the
+  memgraph#4777 head forces on for CI with a "revert before merge" note; with no experimental flags at all, this
+  branch therefore holds the engine lock through durability the way `master` does, and the #4777 head does not.
 
 Maintenance sites that used to take `commit_mutex_` to exclude an in-flight committer now call
 `InMemoryStorage::QuiesceCommits()` (take `commit_mutex_`, then wait until every issued ticket has retired): epoch
@@ -100,6 +103,10 @@ sequence for the ASYNC arm of an abort decision.
 Every retained S2 allocation (materialized commands, tracking sets, the vertex cache, the WAL buffer) goes through
 `BudgetAllocator`, which charges the per-database `PipelineBudget` before allocating and releases in `deallocate`.
 Refusal never blocks: it converts the commit into the ordered legacy path after destroying every charged allocation.
+The budget covers retained bytes only. The per-value temporaries the encoder makes while converting one property at
+a time (the decoded `PropertyValue` and its external form) are not charged; they are the allocations any property
+read makes, freed before the next value, so with N concurrent encoders the transient peak is N times today's
+single-encoder peak, bounded by the largest single property value in flight.
 
 ## Deferred
 
@@ -160,8 +167,11 @@ same three builds as above, #4769 being the constraint optimization):
 - `storage_v2_durability_inmemory`: a pipelined `WalDeathResilience` variant (six writers killed at a random point).
 - `utils_priority_thread_pool`: sixteen commit-shaped tasks on four workers with a slow head.
 - `tests/manual/pipelined_commit_worker_liveness.py`: sixteen Bolt writers and a reader against a real server with
-  four Bolt workers while the head is parked in its encode stage; PERIODIC COMMIT and a before-commit trigger.
-- The full storage sweep passes with no new skips; the assertion-enabled build of the new suites passes.
+  four Bolt workers while the head is parked in its encode stage; PERIODIC COMMIT and a before-commit trigger. The
+  park hook it drives (`MG_TEST_PIPELINED_S2_PARK_FIFO`) is compiled only into builds without `NDEBUG`.
+- The full storage sweep passes with no new skips. A build of memgraph's sources without `NDEBUG` (so `DMG_ASSERT`
+  and the debug arena-ownership check in `DbDeallocateBytes` are live) passes every suite above and the liveness
+  script.
 
 ## Scope
 
