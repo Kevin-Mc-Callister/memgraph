@@ -7,6 +7,7 @@ target_sources(mg-storage-v2
         async_indexer.cpp
         commit_args.cpp
         commit_log.cpp
+        commit_order_gate.cpp
         config.cpp
         constraint_verification_info.cpp
         delta.cpp
@@ -28,6 +29,7 @@ target_sources(mg-storage-v2
         disk/storage.cpp
         disk/unique_constraints.cpp
         durability/durability.cpp
+        durability/buffer_encoder.cpp
         durability/serialization.cpp
         durability/snapshot.cpp
         durability/wal.cpp

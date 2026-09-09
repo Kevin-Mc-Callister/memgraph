@@ -11,7 +11,10 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 
 #include <utils/priority_thread_pool.hpp>
@@ -907,4 +910,66 @@ TEST(PriorityThreadPool, MonitorSweep_DeadlineExpiredAnyTag) {
 
   pool.ShutDown();
   pool.AwaitShutdown();
+}
+
+// ==================================================================================
+// Pipelined commit: worker liveness under a slow head
+// ==================================================================================
+
+// Sixteen commit-shaped tasks on a four-worker pool. Each task encodes (off the serializer), then enters an
+// order gate in ticket order and retires; the head parks in its encode stage for 500 ms while the other running
+// tasks wait at the gate, holding their worker threads, and the rest queue in the pool. A gate wait is a blocking
+// wait on the worker (the plan promises no latency bound there), so the assertion is bounded completion after the
+// head releases: nothing deadlocks and nothing is lost when more committers than workers are in flight.
+TEST(PriorityThreadPool, PipelinedCommitShapedTasksCompleteAfterSlowHead) {
+  using namespace memgraph;
+  constexpr int kTasks = 16;
+  constexpr int kWorkers = 4;
+  utils::PriorityThreadPool pool{kWorkers, 1};
+
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  int next_ticket = 1;  // the gate admits tickets in order
+  std::atomic<int> completed{0};
+  std::atomic<int> minted{0};
+  auto const enqueue_started = std::chrono::steady_clock::now();
+  for (int i = 0; i < kTasks; ++i) {
+    pool.ScheduledAddTask(
+        [&](utils::Priority) {
+          // S1: a ticket is minted when the committer runs, so a queued task never holds one and every ticket
+          // ahead of a waiter is already on a worker.
+          int const ticket = minted.fetch_add(1, std::memory_order_acq_rel) + 1;
+          // S2: the head is slow, everyone else encodes quickly.
+          std::this_thread::sleep_for(ticket == 1 ? std::chrono::milliseconds(500) : std::chrono::milliseconds(1));
+          // S3: enter in ticket order, publish, retire.
+          {
+            std::unique_lock lock{gate_mutex};
+            gate_cv.wait(lock, [&] { return next_ticket >= ticket; });
+            if (next_ticket == ticket) ++next_ticket;
+          }
+          gate_cv.notify_all();
+          completed.fetch_add(1, std::memory_order_acq_rel);
+        },
+        utils::Priority::LOW);
+  }
+
+  // Bounded completion: the head's 500 ms plus generous slack for fifteen quick successors. The poll outlasts the
+  // asserted bound so a late completion fails the bound rather than the count, and the pool is always shut down
+  // before any assertion can return over workers that still reference this frame.
+  for (int w = 0; completed.load(std::memory_order_acquire) < kTasks && w < 1000; ++w) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  auto const elapsed = std::chrono::steady_clock::now() - enqueue_started;
+  auto const all_completed = completed.load(std::memory_order_acquire) == kTasks;
+  if (!all_completed) {
+    // Let every waiter through so the shutdown below can join them.
+    std::lock_guard lock{gate_mutex};
+    next_ticket = kTasks + 1;
+    gate_cv.notify_all();
+  }
+  pool.ShutDown();
+  pool.AwaitShutdown();
+  EXPECT_TRUE(all_completed);
+  EXPECT_GE(elapsed, std::chrono::milliseconds(500));
+  EXPECT_LT(elapsed, std::chrono::seconds(5));
 }

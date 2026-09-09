@@ -872,9 +872,32 @@ add_unit_test(storage_v2_wal_file
     LINK_TARGETS mg::storage storage_test_utils fmt::fmt
 )
 
+# Deterministic flag-off WAL identity harness (not a gtest): storage_v2_off_identity <output-directory>.
+add_executable(memgraph__unit__storage_v2_off_identity storage_v2_off_identity.cpp)
+target_link_libraries(memgraph__unit__storage_v2_off_identity PRIVATE mg::storage storage_test_utils)
+set_target_properties(memgraph__unit__storage_v2_off_identity PROPERTIES OUTPUT_NAME storage_v2_off_identity)
+
+add_unit_test(storage_v2_commit_order_gate
+    SOURCES storage_v2_commit_order_gate.cpp
+    LINK_TARGETS mg::storage
+    CUSTOM_MAIN
+)
+
+add_unit_test(storage_v2_pipelined_commit
+    SOURCES storage_v2_pipelined_commit.cpp
+    LINK_TARGETS mg::storage mg-flags storage_test_utils
+    CUSTOM_MAIN
+)
+
+add_unit_test(storage_v2_buffer_encoder
+    SOURCES storage_v2_buffer_encoder.cpp
+    LINK_TARGETS mg::storage storage_test_utils
+)
+
 add_unit_test(storage_v2_replication
     SOURCES storage_v2_replication.cpp
     LINK_TARGETS mg::storage mg-dbms fmt::fmt mg-repl_coord_glue
+    CUSTOM_MAIN
 )
 
 add_unit_test(storage_v2_error

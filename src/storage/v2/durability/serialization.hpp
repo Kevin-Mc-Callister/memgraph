@@ -59,9 +59,13 @@ class Encoder final : public BaseEncoder {
   bool OpenExisting(const std::filesystem::path &path);
 
   void Close();
-  // Main write function, the only one that is allowed to write to the `file_`
+  // Main write function; together with WriteRaw the only ones that are allowed to write to the `file_`
   // directly.
   void Write(const uint8_t *data, uint64_t size);
+
+  /// Writes already-encoded bytes: advances the logical position and size, does not touch the CRC accumulator.
+  /// For appending a transaction that was encoded, CRC included, into a private buffer.
+  void WriteRaw(const uint8_t *data, uint64_t size);
 
   /// See NonConcurrentOutputFile::AppendFrom.
   [[nodiscard]] std::optional<uint64_t> AppendFrom(int src_fd, uint64_t size)
