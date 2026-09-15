@@ -1331,6 +1331,10 @@ std::expected<void, StorageManipulationError> InMemoryStorage::InMemoryAccessor:
 
   FinalizeTransaction();
 
+  // The previous segment's deltas may already have been collected. Carrying its writes into
+  // another commit would insert constraint entries without deltas to arm their next sweep.
+  if (transaction_.constraint_verification_info) transaction_.constraint_verification_info->Clear();
+
   auto *mem_storage = static_cast<InMemoryStorage *>(storage_);
 
   auto new_transaction = mem_storage->CreateTransaction(transaction_.isolation_level, transaction_.storage_mode);
