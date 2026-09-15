@@ -37,6 +37,8 @@ struct Transaction;
 class Storage;
 
 class InMemoryUniqueConstraints : public UniqueConstraints {
+  friend struct InMemoryUniqueConstraintsTestAccess;
+
  public:
   explicit InMemoryUniqueConstraints(metrics::GaugeHandle gauge = {}) : gauge_{gauge} {}
 
