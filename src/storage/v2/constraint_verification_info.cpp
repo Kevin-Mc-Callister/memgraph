@@ -26,11 +26,13 @@ ConstraintVerificationInfo &ConstraintVerificationInfo::operator=(ConstraintVeri
 void ConstraintVerificationInfo::AddedLabel(LabelId label, Vertex const *vertex) {
   // One set feeds both checks, so a label either kind is keyed on is reported to both.
   if (!relevance_.unique_labels.IsInteresting(label) && !relevance_.existence_labels.IsInteresting(label)) return;
+  written_labels_.set(label);
   added_labels_.insert(vertex);
 }
 
 void ConstraintVerificationInfo::AddedProperty(PropertyId property, Vertex const *vertex) {
   if (!relevance_.unique_properties.IsInteresting(property)) return;
+  written_properties_.set(property);
   added_properties_.insert(vertex);
 }
 
@@ -64,5 +66,18 @@ bool ConstraintVerificationInfo::NeedsUniqueConstraintVerification() const {
 
 bool ConstraintVerificationInfo::NeedsExistenceConstraintVerification() const {
   return !added_labels_.empty() || !removed_properties_.empty();
+}
+
+bool ConstraintVerificationInfo::AffectsUniqueConstraint(LabelId label, std::set<PropertyId> const &properties) const {
+  return written_labels_.test(label) ||
+         std::ranges::any_of(properties, [this](PropertyId property) { return written_properties_.test(property); });
+}
+
+void ConstraintVerificationInfo::Clear() {
+  added_labels_.clear();
+  added_properties_.clear();
+  removed_properties_.clear();
+  written_labels_.reset();
+  written_properties_.reset();
 }
 }  // namespace memgraph::storage

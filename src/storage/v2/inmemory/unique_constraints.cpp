@@ -342,6 +342,10 @@ void InMemoryUniqueConstraints::ActiveConstraints::UpdateBeforeCommit(const Vert
     }
 
     for (const auto &[props, individual_constraint] : constraint->second) {
+      if (tx.constraint_verification_info && !tx.constraint_verification_info->AffectsUniqueConstraint(label, props)) {
+        continue;
+      }
+
       // creation can only happen with read only access and here a write happened
       // therefore the constraint is already registered/validated and we don't need to check status
       auto values = vertex->properties.ExtractPropertyValues(props);

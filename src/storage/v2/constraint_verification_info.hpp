@@ -10,8 +10,11 @@
 // licenses/APL.txt.
 #pragma once
 
+#include <set>
+
 #include "storage/v2/interesting_ids.hpp"
 #include "storage/v2/vertex.hpp"
+#include "utils/id_bitmap.hpp"
 
 namespace memgraph::storage {
 
@@ -61,6 +64,13 @@ struct ConstraintVerificationInfo final {
   bool NeedsUniqueConstraintVerification() const;
   bool NeedsExistenceConstraintVerification() const;
 
+  /// Commit may visit a vertex under several constraints. Only insert into a constraint whose
+  /// label or key was written in this transaction, so its entries have matching GC arming.
+  bool AffectsUniqueConstraint(LabelId label, std::set<PropertyId> const &properties) const;
+
+  /// A periodic commit starts a new transaction segment with the same constraint snapshot.
+  void Clear();
+
  private:
   // Update unique constraints to check whether any vertex already has that value
   // Update existence constraints to check whether for that label the node has all the properties present
@@ -73,6 +83,11 @@ struct ConstraintVerificationInfo final {
   // No update to unique constraints because uniqueness is preserved
   // Update existence constraints because it might be the referenced property of the constraint
   std::unordered_set<Vertex const *> removed_properties_;
+
+  // These ids belong to the current transaction segment. GC arming is also gathered across
+  // all vertices in a transaction, so no per-vertex id map is needed here.
+  utils::IdBitmap<LabelId> written_labels_;
+  utils::IdBitmap<PropertyId> written_properties_;
 
   ConstraintRelevance relevance_{};
 };
