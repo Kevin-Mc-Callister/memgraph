@@ -256,10 +256,21 @@ inline bool AnyVersionHasLabelProperties(const Vertex &vertex, LabelId label, st
 // flips the UNDER/OVER early-termination semantics: in ASC iteration values increase so
 // UNDER means "skip, will reach range" and OVER means "stop"; in DESC iteration values
 // decrease so UNDER means "stop, past range" and OVER means "skip, will reach range".
-void AdvanceUntilValid_(auto &index_iterator, const auto &end, auto *&current_vertex, auto &current_vertex_accessor,
-                        auto *storage, auto *transaction, auto view, auto label, const auto &lower_bound,
-                        const auto &upper_bound, auto &permutation_helper, memgraph::storage::Gid max_gid,
-                        std::vector<bool> &match_scratch, bool use_cache = true, bool reverse_iteration = false) {
+/// Why the walk stopped, so that a caller need not re-ask a question already answered.
+enum class AdvanceOutcome : uint8_t {
+  Found,
+  AtEnd,
+  /// Parked on an entry the leading predicate rejects. How far to move on from it is the caller's
+  /// to decide: one can seek past the whole run of equal values and the other can only step.
+  RejectedByPredicate,
+};
+
+AdvanceOutcome AdvanceUntilValid_(auto &index_iterator, const auto &end, auto *&current_vertex,
+                                  auto &current_vertex_accessor, auto *storage, auto *transaction, auto view,
+                                  auto label, const auto &lower_bound, const auto &upper_bound,
+                                  auto &permutation_helper, memgraph::storage::Gid max_gid,
+                                  std::vector<bool> &match_scratch, auto const *leading_predicate,
+                                  bool use_cache = true, bool reverse_iteration = false) {
   for (; index_iterator != end; ++index_iterator) {
     if (index_iterator->vertex == current_vertex) {
       continue;
@@ -344,6 +355,14 @@ void AdvanceUntilValid_(auto &index_iterator, const auto &end, auto *&current_ve
       break;
     }
 
+    // A predicate over the leading value reads the entry, as the bounds above do, so it is asked
+    // here rather than after the vertex is resolved: an entry it rejects then costs one comparison
+    // instead of a visibility check and a property match. A vertex whose current value would pass
+    // carries its own entry, which is what makes rejecting on the stored value sound.
+    if (leading_predicate && !(*leading_predicate)(index_iterator->values[0])) {
+      return AdvanceOutcome::RejectedByPredicate;
+    }
+
     // Visibility filters run after the value-bounds check: bounds depend only on the
     // entry value, so checking them first lets the scan stop at the bound instead of
     // walking past entries invisible to this transaction.
@@ -365,9 +384,10 @@ void AdvanceUntilValid_(auto &index_iterator, const auto &end, auto *&current_ve
                                          use_cache)) {
       current_vertex = index_iterator->vertex;
       current_vertex_accessor = VertexAccessor(current_vertex, storage, transaction);
-      break;
+      return AdvanceOutcome::Found;
     }
   }
+  return AdvanceOutcome::AtEnd;
 }
 
 }  // namespace
@@ -1047,47 +1067,50 @@ uint64_t InMemoryLabelPropertyIndex::RemoveObsoleteEntries(Storage *storage, uin
 
   uint64_t swept = 0;
   auto const remove_from = [&](auto const &all_indexes) {
-    for (auto &all_entry : *all_indexes) {
-      if (token.stop_requested()) return;
-      auto const &label_id = all_entry.label_;
-      auto const &property_paths = all_entry.properties_;
-      // A sweep walks the whole index whether or not it has anything to collect.
-      if (!arming.arms_vertex_index_on(label_id, property_paths)) continue;
-      ++swept;
+    swept += SweepArmedIndexes(
+        arming,
+        token,
+        *all_indexes,
+        [](auto const &all_entry) {
+          return LabelPropertiesKey{.label = all_entry.label_, .properties = all_entry.properties_};
+        },
+        [&](auto const &all_entry) {
+          auto const &label_id = all_entry.label_;
+          auto const &property_paths = all_entry.properties_;
+          bool const stop = WithIndex(all_entry.index_, [&](auto &index) -> bool {
+            auto const &permutationHelper = index.permutations_helper;
+            auto index_acc = index.skiplist.access();
+            auto it = index_acc.begin();
+            auto end_it = index_acc.end();
+            if (it == end_it) return false;
+            auto match_scratch = std::vector<bool>{};
+            while (true) {
+              if (maybe_stop() && token.stop_requested()) return true;
 
-      bool const stop = WithIndex(all_entry.index_, [&](auto &index) -> bool {
-        auto const &permutationHelper = index.permutations_helper;
-        auto index_acc = index.skiplist.access();
-        auto it = index_acc.begin();
-        auto end_it = index_acc.end();
-        if (it == end_it) return false;
-        auto match_scratch = std::vector<bool>{};
-        while (true) {
-          if (maybe_stop() && token.stop_requested()) return true;
+              auto next_it = it;
+              ++next_it;
 
-          auto next_it = it;
-          ++next_it;
-
-          const bool has_next = next_it != end_it;
-          if (!preserve_recent_entries || it->timestamp < oldest_active_start_timestamp) {
-            const bool redundant_duplicate = has_next && it->vertex == next_it->vertex && it->values == next_it->values;
-            if (redundant_duplicate || !AnyVersionHasLabelProperties(*it->vertex,
-                                                                     label_id,
-                                                                     property_paths,
-                                                                     permutationHelper,
-                                                                     it->values.as_view(),
-                                                                     oldest_active_start_timestamp,
-                                                                     match_scratch)) {
-              index_acc.remove(*it);
+              const bool has_next = next_it != end_it;
+              if (!preserve_recent_entries || it->timestamp < oldest_active_start_timestamp) {
+                const bool redundant_duplicate =
+                    has_next && it->vertex == next_it->vertex && it->values == next_it->values;
+                if (redundant_duplicate || !AnyVersionHasLabelProperties(*it->vertex,
+                                                                         label_id,
+                                                                         property_paths,
+                                                                         permutationHelper,
+                                                                         it->values.as_view(),
+                                                                         oldest_active_start_timestamp,
+                                                                         match_scratch)) {
+                  index_acc.remove(*it);
+                }
+              }
+              if (!has_next) break;
+              it = next_it;
             }
-          }
-          if (!has_next) break;
-          it = next_it;
-        }
-        return false;
-      });
-      if (stop) return;
-    }
+            return false;
+          });
+          return stop ? SweepOutcome::STOPPED : SweepOutcome::COMPLETED;
+        });
   };
 
   auto data = all_indices_.ReadCopy();
@@ -1123,27 +1146,23 @@ void InMemoryLabelPropertyIndex::Iterable<EntryT>::Iterator::AdvanceUntilValid()
   constexpr bool is_desc = EntryT::kOrder == IndexOrder::DESC;
   auto const *leading_predicate = self_->leading_predicate_.get();
 
-  while (true) {
-    AdvanceUntilValid_(index_iterator_,
-                       self_->index_accessor_.end(),
-                       current_vertex_,
-                       current_vertex_accessor_,
-                       self_->storage_,
-                       self_->transaction_,
-                       self_->view_,
-                       self_->label_,
-                       self_->lower_bound_,
-                       self_->upper_bound_,
-                       self_->permutation_helper_,
-                       self_->max_gid_,
-                       match_scratch_,
-                       /*use_cache=*/true,
-                       /*reverse_iteration=*/is_desc);
-
-    if (!leading_predicate || index_iterator_ == self_->index_accessor_.end()) break;
-
+  while (AdvanceUntilValid_(index_iterator_,
+                            self_->index_accessor_.end(),
+                            current_vertex_,
+                            current_vertex_accessor_,
+                            self_->storage_,
+                            self_->transaction_,
+                            self_->view_,
+                            self_->label_,
+                            self_->lower_bound_,
+                            self_->upper_bound_,
+                            self_->permutation_helper_,
+                            self_->max_gid_,
+                            match_scratch_,
+                            leading_predicate,
+                            /*use_cache=*/true,
+                            /*reverse_iteration=*/is_desc) == AdvanceOutcome::RejectedByPredicate) {
     auto const &leading_value = index_iterator_->values[0];
-    if ((*leading_predicate)(leading_value)) break;
 
     // Only seek when the group turns out to hold more than the one entry: a seek costs more than
     // the step that has already left a single-entry group behind.
@@ -1495,6 +1514,8 @@ void InMemoryLabelPropertyIndex::ActiveIndices::AbortEntries(AbortableInfo const
   abort_from(index_container_->desc_indices_);
 }
 
+// Not the shared CleanupAllIndices: this holds two vectors behind ForEach, and the refcount sits
+// behind a variant rather than a plain member.
 void InMemoryLabelPropertyIndex::CleanupAllIndices() {
   auto const cleanup = [](auto &indices) {
     auto keep_condition = [](auto const &entry) {
@@ -1511,21 +1532,30 @@ void InMemoryLabelPropertyIndex::CleanupAllIndices() {
 template <typename EntryT>
 void InMemoryLabelPropertyIndex::ChunkedIterable<EntryT>::Iterator::AdvanceUntilValid() {
   constexpr bool is_desc = EntryT::kOrder == IndexOrder::DESC;
-  AdvanceUntilValid_(index_iterator_,
-                     typename utils::SkipListDb<EntryT>::ChunkedIterator{},
-                     current_vertex_,
-                     current_vertex_accessor_,
-                     self_->storage_,
-                     self_->transaction_,
-                     self_->view_,
-                     self_->label_,
-                     self_->lower_bound_,
-                     self_->upper_bound_,
-                     self_->permutation_helper_,
-                     self_->max_gid_,
-                     match_scratch_,
-                     /*use_cache=*/false,
-                     /*reverse_iteration=*/is_desc);
+  auto const end = typename utils::SkipListDb<EntryT>::ChunkedIterator{};
+
+  // Stepping is all this iterator can do about a rejected entry. It walks the lowest level so that
+  // it never passes a node another thread has marked, which a seek over the skip list would, and it
+  // has a chunk end to stay within that a seek does not know about.
+  while (AdvanceUntilValid_(index_iterator_,
+                            end,
+                            current_vertex_,
+                            current_vertex_accessor_,
+                            self_->storage_,
+                            self_->transaction_,
+                            self_->view_,
+                            self_->label_,
+                            self_->lower_bound_,
+                            self_->upper_bound_,
+                            self_->permutation_helper_,
+                            self_->max_gid_,
+                            match_scratch_,
+                            self_->leading_predicate_.get(),
+                            /*use_cache=*/false,
+                            /*reverse_iteration=*/is_desc) == AdvanceOutcome::RejectedByPredicate) {
+    ++index_iterator_;
+    current_vertex_ = nullptr;
+  }
 }
 
 template <typename EntryT>
@@ -1545,6 +1575,10 @@ InMemoryLabelPropertyIndex::ChunkedIterable<EntryT>::ChunkedIterable(
       max_gid_(max_gid) {
   bounds_valid_ = ValidateBounds(ranges, lower_bound_, upper_bound_);  // NOLINT
   if (!bounds_valid_) return;
+
+  if (!ranges.empty()) {
+    leading_predicate_ = ranges[0].GetValuePredicate();
+  }
 
   if constexpr (EntryT::kOrder == IndexOrder::DESC) {
     chunks_ = index_accessor_.create_chunks(

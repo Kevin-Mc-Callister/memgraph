@@ -18,6 +18,7 @@
 #include "storage/v2/id_types.hpp"
 #include "storage/v2/indices/active_indices_updater.hpp"
 #include "storage/v2/indices/indices_utils.hpp"
+#include "storage/v2/inmemory/all_indices_cleanup.hpp"
 #include "storage/v2/inmemory/storage.hpp"
 #include "storage/v2/interesting_ids.hpp"
 #include "storage/v2/property_constants.hpp"
@@ -317,43 +318,43 @@ uint64_t InMemoryEdgeTypePropertyIndex::RemoveObsoleteEntries(Storage *storage, 
 
   auto const preserve_recent_entries = SweepPreservesRecentEntries(storage->GetStorageMode());
 
-  uint64_t swept = 0;
-  for (auto &[index, property] : *all_indices) {
-    if (token.stop_requested()) return swept;
-    // A sweep walks the whole index whether or not it has anything to collect.
-    if (!arming.arms_edge_index_on(property)) continue;
-    ++swept;
+  return SweepArmedIndexes(
+      arming,
+      token,
+      *all_indices,
+      [](auto const &entry) { return EdgePropertyKey{.property = entry.property_}; },
+      [&](auto const &entry) {
+        auto const &property = entry.property_;
+        auto edges_acc = entry.index_->skiplist.access();
+        for (auto it = edges_acc.begin(); it != edges_acc.end();) {
+          if (maybe_stop() && token.stop_requested()) return SweepOutcome::STOPPED;
 
-    auto edges_acc = index->skiplist.access();
-    for (auto it = edges_acc.begin(); it != edges_acc.end();) {
-      if (maybe_stop() && token.stop_requested()) return swept;
+          auto next_it = it;
+          ++next_it;
 
-      auto next_it = it;
-      ++next_it;
+          if (preserve_recent_entries && it->timestamp >= oldest_active_start_timestamp) {
+            it = next_it;
+            continue;
+          }
 
-      if (preserve_recent_entries && it->timestamp >= oldest_active_start_timestamp) {
-        it = next_it;
-        continue;
-      }
+          const bool has_next = next_it != edges_acc.end();
 
-      const bool has_next = next_it != edges_acc.end();
+          // When we update specific entries in the index, we don't delete the previous entry.
+          // The way they are removed from the index is through this check. The entries should
+          // be right next to each other(in terms of iterator semantics) and the older one
+          // should be removed here.
+          const bool redundant_duplicate = has_next && it->value == next_it->value &&
+                                           it->from_vertex == next_it->from_vertex &&
+                                           it->to_vertex == next_it->to_vertex && it->edge == next_it->edge;
+          if (redundant_duplicate ||
+              !AnyVersionHasProperty(*it->edge, property, it->value, oldest_active_start_timestamp)) {
+            edges_acc.remove(*it);
+          }
 
-      // When we update specific entries in the index, we don't delete the previous entry.
-      // The way they are removed from the index is through this check. The entries should
-      // be right next to each other(in terms of iterator semantics) and the older one
-      // should be removed here.
-      const bool redundant_duplicate = has_next && it->value == next_it->value &&
-                                       it->from_vertex == next_it->from_vertex && it->to_vertex == next_it->to_vertex &&
-                                       it->edge == next_it->edge;
-      if (redundant_duplicate ||
-          !AnyVersionHasProperty(*it->edge, property, it->value, oldest_active_start_timestamp)) {
-        edges_acc.remove(*it);
-      }
-
-      it = next_it;
-    }
-  }
-  return swept;
+          it = next_it;
+        }
+        return SweepOutcome::COMPLETED;
+      });
 }
 
 void InMemoryEdgeTypePropertyIndex::ActiveIndices::AbortEntries(
@@ -585,12 +586,7 @@ auto InMemoryEdgeTypePropertyIndex::GetIndividualIndex(EdgeTypeId edge_type, Pro
 }
 
 void InMemoryEdgeTypePropertyIndex::CleanupAllIndices() {
-  all_indices_.WithLock([](std::shared_ptr<std::vector<AllIndicesEntry> const> &indices) {
-    auto keep_condition = [](AllIndicesEntry const &entry) { return entry.index_.use_count() != 1; };
-    if (!r::all_of(*indices, keep_condition)) {
-      indices = std::make_shared<std::vector<AllIndicesEntry>>(*indices | rv::filter(keep_condition) | r::to_vector);
-    }
-  });
+  storage::CleanupAllIndices(all_indices_, [](AllIndicesEntry const &e) { return e.index_.use_count(); });
 }
 
 InMemoryEdgeTypePropertyIndex::ChunkedIterable::ChunkedIterable(

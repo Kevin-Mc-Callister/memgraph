@@ -13,6 +13,7 @@
 // Copyright 2017 Memgraph
 // Created by Florijan Stamenkovic on 24.01.17..
 //
+#include <limits>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -22,6 +23,7 @@
 #include "disk_test_utils.hpp"
 #include "query/db_accessor.hpp"
 #include "query/graph.hpp"
+#include "query/relations/comparability.hpp"
 #include "query/typed_value.hpp"
 #include "storage/v2/disk/storage.hpp"
 #include "storage/v2/inmemory/storage.hpp"
@@ -248,14 +250,104 @@ TEST(TypedValue, Comparison) {
 
   run_comparison_cases(local_date_time_1, local_date_time_2);
 
+  // An enum and a point carry no order of their own, so comparability places no
+  // pair of them and answers Null rather than refusing the question.
   auto enum_val = TypedValue{Enum{EnumTypeId{1}, EnumValueId{11}}};
-  EXPECT_THROW((void)(enum_val < enum_val), memgraph::query::TypedValueException);
+  EXPECT_PROP_ISNULL(enum_val < enum_val);
 
   auto point_1 = TypedValue{Point2d{Cartesian_2d, 1.0, 2.0}};
   auto point_2 = TypedValue{Point3d{WGS84_3d, 1.0, 2.0, 3.0}};
 
-  EXPECT_THROW((void)(point_1 < point_1), memgraph::query::TypedValueException);
-  EXPECT_THROW((void)(point_2 < point_2), memgraph::query::TypedValueException);
+  EXPECT_PROP_ISNULL(point_1 < point_1);
+  EXPECT_PROP_ISNULL(point_2 < point_2);
+}
+
+namespace {
+TypedValue List(std::vector<TypedValue> elements) { return TypedValue(std::move(elements)); }
+
+TypedValue Map(std::map<std::string, TypedValue> entries) { return TypedValue(std::move(entries)); }
+}  // namespace
+
+TEST(TypedValue, ComparabilityLeavesAnUnorderedPairFalseInAllFourReadings) {
+  // Comparability is partial. A NaN has no order against anything, itself
+  // included, so all four comparisons are false for it. Reading one as the
+  // negation of another assumes every pair is ordered and turns the missing
+  // order into a true.
+  auto const nan = TypedValue(std::numeric_limits<double>::quiet_NaN());
+  for (auto const &other : {TypedValue(0), TypedValue(1.5), nan}) {
+    EXPECT_PROP_FALSE(nan < other);
+    EXPECT_PROP_FALSE(nan <= other);
+    EXPECT_PROP_FALSE(nan > other);
+    EXPECT_PROP_FALSE(nan >= other);
+    EXPECT_PROP_FALSE(other < nan);
+    EXPECT_PROP_FALSE(other <= nan);
+    EXPECT_PROP_FALSE(other > nan);
+    EXPECT_PROP_FALSE(other >= nan);
+  }
+}
+
+TEST(TypedValue, ComparabilityPlacesBooleans) {
+  // A boolean carries an order Cypher gives it, and refusing to read it made a
+  // range over such a column impossible to write.
+  EXPECT_PROP_TRUE(TypedValue(false) < TypedValue(true));
+  EXPECT_PROP_FALSE(TypedValue(true) < TypedValue(false));
+  EXPECT_PROP_TRUE(TypedValue(false) <= TypedValue(false));
+  EXPECT_PROP_TRUE(TypedValue(true) > TypedValue(false));
+}
+
+TEST(TypedValue, ComparabilityAnswersNullForAPairItCannotPlace) {
+  // A pair of unlike types has no order between it, and neither has a pair of
+  // one type carrying no order of its own. Neither raises: having no order is
+  // an answer this relation gives rather than a question it refuses.
+  EXPECT_PROP_ISNULL(TypedValue(1) < TypedValue("a"));
+  EXPECT_PROP_ISNULL(TypedValue("a") < TypedValue(1));
+
+  // A list and a map are placed by orderability alone, so a sort arranges two
+  // of them while all four comparisons answer Null. Placing a list here means
+  // ordering it by its elements, which is not the order the store keeps one in,
+  // and a scan reading that order stands in for this comparison.
+  EXPECT_PROP_ISNULL(List({TypedValue(1)}) < List({TypedValue(2)}));
+  EXPECT_PROP_ISNULL(List({TypedValue()}) < List({TypedValue()}));
+  EXPECT_PROP_ISNULL(Map({{"k", TypedValue(1)}}) < Map({{"k", TypedValue(2)}}));
+}
+
+TEST(TypedValue, EqualityOfAContainerHoldingNullIsUndecided) {
+  // A Null element stands for a value nobody knows, so a comparison that has to
+  // read one cannot answer. It answers Null, exactly as `null = null` does.
+  EXPECT_PROP_ISNULL(List({TypedValue()}) == List({TypedValue()}));
+  EXPECT_PROP_ISNULL(List({TypedValue(1), TypedValue(), TypedValue(3)}) ==
+                     List({TypedValue(1), TypedValue(), TypedValue(3)}));
+  EXPECT_PROP_ISNULL(List({TypedValue()}) != List({TypedValue()}));
+  EXPECT_PROP_ISNULL(Map({{"k", TypedValue()}}) == Map({{"k", TypedValue()}}));
+
+  // Null against a known value is undecided for the same reason: nothing here
+  // shows the two differ.
+  EXPECT_PROP_ISNULL(List({TypedValue()}) == List({TypedValue(1)}));
+  EXPECT_PROP_ISNULL(Map({{"k", TypedValue()}}) == Map({{"k", TypedValue(1)}}));
+}
+
+TEST(TypedValue, EqualityOfAContainerAnswersWhereOneElementSettlesIt) {
+  // An element that differs proves the two containers differ, whatever else
+  // they hold, so a Null elsewhere does not hide it.
+  EXPECT_PROP_NE(List({TypedValue(), TypedValue(1)}), List({TypedValue(), TypedValue(2)}));
+  EXPECT_PROP_NE(Map({{"a", TypedValue()}, {"b", TypedValue(1)}}), Map({{"a", TypedValue()}, {"b", TypedValue(2)}}));
+
+  // So does a length that differs, or a key one side does not have.
+  EXPECT_PROP_NE(List({TypedValue()}), List({TypedValue(), TypedValue()}));
+  EXPECT_PROP_NE(Map({{"a", TypedValue()}}), Map({{"b", TypedValue()}}));
+
+  // And a container holding no Null at all still answers.
+  EXPECT_PROP_EQ(List({TypedValue(1)}), List({TypedValue(1)}));
+  EXPECT_PROP_NE(List({TypedValue(1)}), List({TypedValue(2)}));
+}
+
+TEST(TypedValue, EquivalenceOfAContainerHoldingNullDecides) {
+  // Equivalence is two-valued, which is what a hash container needs: it holds a
+  // Null equivalent to a Null so a key can be found again.
+  auto eq = TypedValue::BoolEqual{};
+  EXPECT_TRUE(eq(List({TypedValue()}), List({TypedValue()})));
+  EXPECT_TRUE(eq(Map({{"k", TypedValue()}}), Map({{"k", TypedValue()}})));
+  EXPECT_FALSE(eq(List({TypedValue()}), List({TypedValue(1)})));
 }
 
 TEST(TypedValue, BoolEquals) {
@@ -370,18 +462,15 @@ TYPED_TEST(AllTypesFixture, CreationValuesFromPropertyValues) {
 }
 
 TYPED_TEST(AllTypesFixture, Less) {
-  // 'Less' is legal only between numerics, Null and strings.
-  using memgraph::query::is_canonical;
-  auto is_string_compatible = [](const TypedValue &v) { return v.IsNull() || v.type() == TypedValue::Type::String; };
-  auto is_numeric_compatible = [](const TypedValue &v) { return v.IsNull() || v.IsNumeric(); };
+  // Comparability answers for every pair it is handed, and none of them raises.
+  // Where it has no order to give it says so with Null, which is every pair of
+  // unlike types that are not both numbers.
   for (TypedValue &a : this->values_) {
     for (TypedValue &b : this->values_) {
-      if (is_canonical(a.type()) || is_canonical(b.type())) continue;
-      if (is_numeric_compatible(a) && is_numeric_compatible(b)) continue;
-      if (is_string_compatible(a) && is_string_compatible(b)) continue;
-      // Comparison should raise an exception. Cast to (void) so the compiler
-      // does not complain about unused comparison result.
-      EXPECT_THROW((void)(a < b), TypedValueException);
+      EXPECT_NO_THROW((void)(a < b));
+      if (a.type() != b.type() && !(a.IsNumeric() && b.IsNumeric())) {
+        EXPECT_PROP_ISNULL(a < b);
+      }
     }
   }
 
@@ -784,13 +873,12 @@ TYPED_TEST(AllTypesFixture, CopyConstruction) {
       EXPECT_PROP_ISNULL(cpy);
     } else if (value.IsGraph()) {
       // not comparable
-    } else if (value.IsMap()) {
-      // map contains NULL so can't be true
-      auto res = cpy == value;
-      // THIS IS NOT THE SAME AS NEO4J
-      // NEO4J returns NULL
-      ASSERT_EQ(res.type(), TypedValue::Type::Bool);
-      ASSERT_EQ(res.ValueBool(), false);
+    } else if (value.IsList() || value.IsMap()) {
+      // Both hold a Null, so equality cannot decide that the copy is the same
+      // value: it answers Null. Equivalence is the relation that does decide,
+      // and the one that has to, since a hash container is keyed by it.
+      EXPECT_TRUE(TypedValue::BoolEqual{}(cpy, value));
+      EXPECT_PROP_ISNULL(cpy == value);
     } else {
       EXPECT_PROP_EQ(cpy, value);
     }

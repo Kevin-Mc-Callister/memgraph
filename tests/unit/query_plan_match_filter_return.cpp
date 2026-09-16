@@ -3376,6 +3376,14 @@ TYPED_TEST(QueryPlan, Distinct) {
        TypedValue()},
       {TypedValue(3), TypedValue("two"), TypedValue(), TypedValue(true), TypedValue(false), TypedValue("TWO")},
       false);
+
+  // A container holding a Null is the same value as itself, so one of each
+  // survives. Equality cannot decide this and answers Null; DISTINCT reads
+  // equivalence, which decides.
+  auto const list_of_null = [] { return TypedValue(std::vector<TypedValue>{TypedValue()}); };
+  auto const map_of_null = [] { return TypedValue(std::map<std::string, TypedValue>{{"k", TypedValue()}}); };
+  check_distinct(
+      {list_of_null(), list_of_null(), map_of_null(), map_of_null()}, {list_of_null(), map_of_null()}, false);
 }
 
 TYPED_TEST(QueryPlan, ScanAllByLabel) {
@@ -3406,6 +3414,68 @@ TYPED_TEST(QueryPlan, ScanAllByLabel) {
   ASSERT_EQ(result_row.size(), 1);
   auto result_vertex = result_row[0].ValueVertex();
   EXPECT_EQ(result_vertex.Gid(), labeled_vertex.Gid());
+}
+
+TYPED_TEST(QueryPlan, EqualityAgainstAListHoldingNullKeepsNoRowWithOrWithoutAnIndex) {
+  // Equality against a value holding a Null answers Null, so no row passes the
+  // filter. The index has to keep none of them either, or the same query gives
+  // a different answer once the index exists.
+  auto label = this->db->NameToLabel("label");
+  auto prop = this->db->NameToProperty("prop");
+
+  {
+    auto storage_dba = this->db->Access(memgraph::storage::WRITE);
+    memgraph::query::DbAccessor dba(storage_dba.get());
+    for (auto const &stored :
+         {std::vector{memgraph::storage::PropertyValue()}, std::vector{memgraph::storage::PropertyValue(1)}}) {
+      auto vertex = dba.InsertVertex();
+      ASSERT_TRUE(vertex.AddLabel(label).has_value());
+      ASSERT_TRUE(vertex.SetProperty(prop, memgraph::storage::PropertyValue(stored)).has_value());
+    }
+    ASSERT_TRUE(dba.Commit(memgraph::tests::MakeMainCommitArgs()).has_value());
+  }
+
+  auto count_without_the_index = [&](memgraph::query::DbAccessor &dba) {
+    SymbolTable symbol_table;
+    auto scan_all = MakeScanAll(this->storage, symbol_table, "n");
+    auto *sought = LIST(LITERAL(TypedValue()));
+    auto *filter_expression = EQ(PROPERTY_LOOKUP(dba, IDENT("n")->MapTo(scan_all.sym_), prop), sought);
+    auto filter =
+        std::make_shared<Filter>(scan_all.op_, std::vector<std::shared_ptr<LogicalOperator>>{}, filter_expression);
+    auto output = NEXPR("n", IDENT("n")->MapTo(scan_all.sym_))->MapTo(symbol_table.CreateSymbol("n", true));
+    auto produce = MakeProduce(filter, output);
+    auto context = MakeContext(this->storage, symbol_table, &dba);
+    return CollectProduce(*produce, &context).size();
+  };
+
+  auto count_with_the_index = [&](memgraph::query::DbAccessor &dba) {
+    SymbolTable symbol_table;
+    auto scan_all =
+        MakeScanAllByLabelPropertyValue(this->storage, symbol_table, "n", label, prop, LIST(LITERAL(TypedValue())));
+    auto output = NEXPR("n", IDENT("n")->MapTo(scan_all.sym_))->MapTo(symbol_table.CreateSymbol("n", true));
+    auto produce = MakeProduce(scan_all.op_, output);
+    auto context = MakeContext(this->storage, symbol_table, &dba);
+    return CollectProduce(*produce, &context).size();
+  };
+
+  {
+    auto storage_dba = this->db->Access(memgraph::storage::WRITE);
+    memgraph::query::DbAccessor dba(storage_dba.get());
+    EXPECT_EQ(0, count_without_the_index(dba));
+  }
+
+  {
+    auto unique_acc = this->db->UniqueAccess();
+    [[maybe_unused]] auto _ = unique_acc->CreateIndex(label, {prop});
+    ASSERT_TRUE(unique_acc->PrepareForCommitPhase(memgraph::tests::MakeMainCommitArgs()).has_value());
+  }
+
+  {
+    auto storage_dba = this->db->Access(memgraph::storage::WRITE);
+    memgraph::query::DbAccessor dba(storage_dba.get());
+    EXPECT_EQ(0, count_with_the_index(dba));
+    EXPECT_EQ(0, count_without_the_index(dba));
+  }
 }
 
 TYPED_TEST(QueryPlan, ScanAllByLabelProperties) {
@@ -3577,7 +3647,10 @@ TYPED_TEST(QueryPlan, ScanAllByLabelPropertyEqualityNoError) {
   EXPECT_TRUE(eq(value, TypedValue(42)));
 }
 
-TYPED_TEST(QueryPlan, ScanAllByLabelPropertyValueError) {
+TYPED_TEST(QueryPlan, ScanAllByLabelPropertyValueOverASoughtValueThatIsNotAPropertyValue) {
+  // Nothing stored equals a graph element, so the filter this scan stands in for
+  // keeps no row and never needs the value as a property. The scan keeps none as
+  // well, rather than raising over a conversion it did not have to make.
   auto label = this->db->NameToLabel("label");
   auto prop = this->db->NameToProperty("prop");
   {
@@ -3607,10 +3680,14 @@ TYPED_TEST(QueryPlan, ScanAllByLabelPropertyValueError) {
   auto scan_index =
       MakeScanAllByLabelPropertyValue(this->storage, symbol_table, "n", label, prop, ident_m, scan_all.op_);
   auto context = MakeContext(this->storage, symbol_table, &dba);
-  EXPECT_THROW(PullAll(*scan_index.op_, &context), QueryRuntimeException);
+  EXPECT_EQ(PullAll(*scan_index.op_, &context), 0);
 }
 
-TYPED_TEST(QueryPlan, ScanAllByLabelPropertyRangeError) {
+TYPED_TEST(QueryPlan, ScanAllByLabelPropertyRangeOverABoundThatIsNotAPropertyValue) {
+  // A graph element is not a value comparability places against a stored
+  // property, so the comparison is Null for every row and the filter this scan
+  // stands in for keeps none. The scan has to keep none as well, rather than
+  // raising over a value it would never have had to store.
   auto label = this->db->NameToLabel("label");
   auto prop = this->db->NameToProperty("prop");
   {
@@ -3648,7 +3725,7 @@ TYPED_TEST(QueryPlan, ScanAllByLabelPropertyRangeError) {
                                                       std::nullopt,
                                                       scan_all.op_);
     auto context = MakeContext(this->storage, symbol_table, &dba);
-    EXPECT_THROW(PullAll(*scan_index.op_, &context), QueryRuntimeException);
+    EXPECT_EQ(PullAll(*scan_index.op_, &context), 0);
   }
   {
     // Upper bound isn't property value
@@ -3661,7 +3738,7 @@ TYPED_TEST(QueryPlan, ScanAllByLabelPropertyRangeError) {
                                                       Bound{ident_m, Bound::Type::INCLUSIVE},
                                                       scan_all.op_);
     auto context = MakeContext(this->storage, symbol_table, &dba);
-    EXPECT_THROW(PullAll(*scan_index.op_, &context), QueryRuntimeException);
+    EXPECT_EQ(PullAll(*scan_index.op_, &context), 0);
   }
   {
     // Both bounds aren't property value
@@ -3674,7 +3751,7 @@ TYPED_TEST(QueryPlan, ScanAllByLabelPropertyRangeError) {
                                                       Bound{ident_m, Bound::Type::INCLUSIVE},
                                                       scan_all.op_);
     auto context = MakeContext(this->storage, symbol_table, &dba);
-    EXPECT_THROW(PullAll(*scan_index.op_, &context), QueryRuntimeException);
+    EXPECT_EQ(PullAll(*scan_index.op_, &context), 0);
   }
 }
 

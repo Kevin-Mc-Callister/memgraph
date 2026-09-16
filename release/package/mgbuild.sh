@@ -63,7 +63,7 @@ SUPPORTED_ARCHS=(
 SUPPORTED_TESTS=(
     clang-tidy cppcheck-and-clang-format code-analysis
     code-coverage drivers drivers-high-availability durability e2e e2e-parallel gql-behave
-    integration leftover-CTest macro-benchmark
+    integration integration-parallel leftover-CTest macro-benchmark
     mgbench stress-plain stress-ssl
     query_modules_e2e query_modules_unit
     unit unit-coverage upload-to-bench-graph
@@ -159,12 +159,15 @@ print_help () {
   echo -e "  --disable-jemalloc            Build without jemalloc"
   echo -e "  --disable-testing             Build without tests (faster build for packaging)"
   echo -e "  --link-threads int            Pin the number of concurrent link steps (default 0: derived from the memory available to the container). Compile parallelism is unaffected."
+  echo -e "  --memory-per-compile-job-mb int  Memory budgeted per compile step when deriving parallelism (maps to -DMG_MEMORY_PER_COMPILE_JOB_MB)."
+  echo -e "  --memory-per-link-job-mb int  Memory budgeted per link step when deriving parallelism (maps to -DMG_MEMORY_PER_LINK_JOB_MB)."
   echo -e "  --split-debug                 Extract debug info into sidecar .debug files (requires --build-type RelWithDebInfo or Debug)"
   echo -e "  --mage MODE                   MAGE query modules: off (default), on (build alongside memgraph), only (just MAGE; trims the conan graph). Mirrors build.sh's --mage. Combine with global --cugraph for GPU modules."
   echo -e "  --cuda                        CUDA flavour of the mage package: ships the GPU python requirements (maps to -DMG_MAGE_CUDA=ON; implied by --cugraph)."
   echo -e "  --no-python                   Build memgraph without the embedded Python interpreter (maps to -DMG_PYTHON_SUPPORT=OFF; the package then has no libpython/python3/pip dependencies)."
   echo -e "  --python-build-version str    Build against an exact Python version, e.g. 3.12 (default \"\", uses the container's default Python). Maps to -DMG_PYTHON_VERSION."
   echo -e "  --python-runtime-version str  After building, remove the build Python and install this version instead (Ubuntu/deadsnakes), so subsequent test steps run the abi3 binary against a different libpython (default \"\", no swap)."
+  echo -e "  --no-abi3-rewrite             Skip the abi3 DT_NEEDED rewrite and the libpython3.so symlink (maps to -DMG_PYTHON_REWRITE_DT_NEEDED=OFF). Binaries keep the versioned libpython dependency; faster for CI builds that only test on the build container. Incompatible with --python-runtime-version."
   echo -e "  --conan-remote string         Specify conan remote (default \"\")"
   echo -e "  --conan-username string       Specify conan username (default \"\")"
   echo -e "  --conan-password string       Specify conan password (default \"\")"
@@ -701,6 +704,8 @@ build_memgraph () {
   local conan_password=""
   local build_dependency=""
   local link_threads=0
+  local memory_per_compile_job_mb=0
+  local memory_per_link_job_mb=0
   local split_debug=false
   local mage_mode="off"
   local mage_cuda=false
@@ -708,6 +713,8 @@ build_memgraph () {
   local python_build_version_flag=""
   local python_runtime_version=""
   local python_support_flag=""
+  local abi3_rewrite=true
+  local abi3_rewrite_flag=""
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       --community)
@@ -766,6 +773,14 @@ build_memgraph () {
         link_threads=$2
         shift 2
       ;;
+      --memory-per-compile-job-mb)
+        memory_per_compile_job_mb=$2
+        shift 2
+      ;;
+      --memory-per-link-job-mb)
+        memory_per_link_job_mb=$2
+        shift 2
+      ;;
       --split-debug)
         split_debug=true
         shift 1
@@ -795,6 +810,11 @@ build_memgraph () {
         python_runtime_version="$2"
         shift 2
       ;;
+      --no-abi3-rewrite)
+        abi3_rewrite=false
+        abi3_rewrite_flag="-DMG_PYTHON_REWRITE_DT_NEEDED=OFF"
+        shift 1
+      ;;
       *)
         echo "Error: Unknown flag '$1'"
         print_help
@@ -802,6 +822,13 @@ build_memgraph () {
       ;;
     esac
   done
+
+  # The runtime swap only proves anything if the binary resolves libpython via
+  # the unversioned abi3 SONAME, which is exactly what the rewrite provides.
+  if [[ "$abi3_rewrite" == false && -n "$python_runtime_version" ]]; then
+    echo "Error: --no-abi3-rewrite cannot be combined with --python-runtime-version (the swap relies on the abi3 DT_NEEDED rewrite)" >&2
+    exit 1
+  fi
 
   echo "Initializing deps ..."
   # If master is not the current branch, fetch it, because the get_version
@@ -852,9 +879,11 @@ build_memgraph () {
   # and the rewritten binary must be loadable for the config/generate.py
   # POST_BUILD step. RPM distros ship libpython3.so natively; Debian/Ubuntu ship
   # only versioned libpython, so create the symlink here. Idempotent: a no-op
-  # where libpython3.so already exists. Run unconditionally because the dep step
-  # above is skipped when `check` passes against a pre-provisioned image.
-  docker exec -u root "$build_container" bash -c "source $MGBUILD_ROOT_DIR/environment/util.sh && ensure_libpython3_so_symlink"
+  # where libpython3.so already exists. Not gated on the dep step above (which is
+  # skipped when `check` passes); only --no-abi3-rewrite skips it.
+  if [[ "$abi3_rewrite" == true ]]; then
+    docker exec -u root "$build_container" bash -c "source $MGBUILD_ROOT_DIR/environment/util.sh && ensure_libpython3_so_symlink"
+  fi
 
   echo "Building targeted package..."
   # Fix issue with git marking directory as not safe
@@ -990,7 +1019,7 @@ build_memgraph () {
 
   # Add additional CMake options if any are specified
   local additional_options=""
-  local flags=("$arm_flag" "$community_flag" "$coverage_flag" "$asan_flag" "$ubsan_flag" "$disable_jemalloc_flag" "$disable_testing_flag" "$python_build_version_flag" "$python_support_flag")
+  local flags=("$arm_flag" "$community_flag" "$coverage_flag" "$asan_flag" "$ubsan_flag" "$disable_jemalloc_flag" "$disable_testing_flag" "$python_build_version_flag" "$python_support_flag" "$abi3_rewrite_flag")
 
   for flag in "${flags[@]}"; do
     if [[ -n "$flag" ]]; then
@@ -1013,6 +1042,14 @@ build_memgraph () {
   # Pin link concurrency instead of deriving it from the container's memory.
   if [[ "$link_threads" -gt 0 ]]; then
     additional_options="$additional_options -DMG_LINK_JOBS=$link_threads"
+  fi
+
+  # Retune the per-job memory budgets that derive the compile/link pool sizes.
+  if [[ "$memory_per_compile_job_mb" -gt 0 ]]; then
+    additional_options="$additional_options -DMG_MEMORY_PER_COMPILE_JOB_MB=$memory_per_compile_job_mb"
+  fi
+  if [[ "$memory_per_link_job_mb" -gt 0 ]]; then
+    additional_options="$additional_options -DMG_MEMORY_PER_LINK_JOB_MB=$memory_per_link_job_mb"
   fi
 
   # Extract debug info into sidecar .debug files post-link (requires RWD/Debug).
@@ -1824,6 +1861,11 @@ test_memgraph() {
     export MONITORING_USE_HOST_NETWORK="true"
   }
 
+  resolve_integration_parallel_monitoring_targets() {
+    # Suites run on fixed per-suite port blocks, so the targets are known up front.
+    _import_monitoring_targets "$("$PROJECT_ROOT/tests/integration/run-parallel.sh" monitoring-targets "$build_container")"
+  }
+
   resolve_eks_ha_monitoring_targets() {
     _import_monitoring_targets "$("$PROJECT_ROOT/tests/stress/ha/eks/deployment/deployment.sh" monitoring-targets)"
     # EKS monitoring targets are public endpoints; host network mode avoids the need for a shared Docker network.
@@ -1834,6 +1876,7 @@ test_memgraph() {
     case "$test_name" in
       stress-native-ha)  resolve_native_ha_monitoring_targets ;;
       stress-docker-ha)  resolve_docker_ha_monitoring_targets ;;
+      integration-parallel) resolve_integration_parallel_monitoring_targets ;;
       # EKS targets are resolved later in the case body, after the cluster exists.
       stress-eks-ha)     : ;;
     esac
@@ -1878,7 +1921,7 @@ test_memgraph() {
     unit-coverage)
       local setup_lsan_ubsan="export LSAN_OPTIONS=suppressions=$BUILD_DIR/../tools/lsan.supp && export UBSAN_OPTIONS=halt_on_error=1"
       local status=0
-      docker exec -u mg $build_container bash -c "$EXPORT_LICENSE && $EXPORT_ORG_NAME && cd $BUILD_DIR && $ACTIVATE_TOOLCHAIN && $setup_lsan_ubsan "'&& mkdir -p test-results && ctest -R memgraph__unit --output-on-failure -j2 --output-junit test-results/unit-coverage.xml' || status=$?
+      docker exec -u mg $build_container bash -c "$EXPORT_LICENSE && $EXPORT_ORG_NAME && cd $BUILD_DIR && $ACTIVATE_TOOLCHAIN && $setup_lsan_ubsan "'&& mkdir -p test-results && ctest -R memgraph__unit --output-on-failure -j$(nproc) --output-junit test-results/unit-coverage.xml' || status=$?
       collect_ctest_results "$status"
     ;;
     leftover-CTest)
@@ -1905,6 +1948,14 @@ test_memgraph() {
     ;;
     integration)
       docker exec -u mg $build_container bash -c "$EXPORT_LICENSE && $EXPORT_ORG_NAME && cd $MGBUILD_ROOT_DIR && tests/integration/run.sh"
+    ;;
+    integration-parallel)
+      # Runs each suite on its own port block; --threads caps the job count (default: container nproc).
+      local integration_jobs=""
+      if [[ "$threads" != "$DEFAULT_THREADS" ]]; then
+        integration_jobs="$threads"
+      fi
+      docker exec -u mg $build_container bash -c "$EXPORT_LICENSE && $EXPORT_ORG_NAME && cd $MGBUILD_ROOT_DIR && tests/integration/run-parallel.sh $integration_jobs"
     ;;
     cppcheck-and-clang-format)
       local test_output_path="$MGBUILD_ROOT_DIR/tools/github/cppcheck_and_clang_format.txt"

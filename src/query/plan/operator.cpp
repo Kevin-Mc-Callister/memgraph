@@ -12,10 +12,13 @@
 #include "query/plan/operator.hpp"
 #include <range/v3/all.hpp>
 #include "metrics/prometheus_metrics.hpp"
+#include "query/relations/comparability.hpp"
+#include "query/relations/equality.hpp"
 
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <exception>
 #include <execution>
 #include <functional>
 #include <limits>
@@ -168,22 +171,33 @@ auto ExpressionRange::Range(std::optional<utils::Bound<Expression *>> lower,
 auto ExpressionRange::IsNotNull() -> ExpressionRange { return {Type::IS_NOT_NULL, std::nullopt, std::nullopt}; }
 
 auto ExpressionRange::Evaluate(ExpressionEvaluator &evaluator) const -> storage::PropertyValueRange {
-  auto const to_bounded_property_value = [&](auto &value) -> std::optional<utils::Bound<storage::PropertyValue>> {
-    if (value == std::nullopt) {
-      return std::nullopt;
-    } else {
-      auto const typed_value = value->value()->Accept(evaluator);
-      if (!typed_value.IsPropertyValue()) {
-        throw QueryRuntimeException("'{}' cannot be used as a property value.", typed_value.type());
-      }
-      return utils::Bound{typed_value.ToPropertyValue(evaluator.GetNameIdMapper()), value->type()};
+  auto const bound_from = [&](TypedValue const &typed_value, auto bound_type) {
+    // Every caller asks this first, so the branch is unreached. Kept so that one that stops
+    // asking refuses the query rather than converting a value out of a type holding none.
+    if (!typed_value.IsPropertyValue()) {
+      throw QueryRuntimeException("'{}' cannot be used as a property value.", typed_value.type());
     }
+    return utils::Bound{typed_value.ToPropertyValue(evaluator.GetNameIdMapper()), bound_type};
   };
 
   switch (type_) {
     case Type::EQUAL:
     case Type::IN: {
-      auto bounded_property_value = to_bounded_property_value(lower_);
+      if (!lower_) return storage::PropertyValueRange::Bounded(std::nullopt, std::nullopt);
+      auto const typed_value = lower_->value()->Accept(evaluator);
+      // Equality against a value holding a Null answers Null for every row, so a filter keeps
+      // none of them. The scan has to agree, or the same query answers differently once an index
+      // exists. The Null is read before the value is converted, because a value holding one need
+      // not be storable at all: converting `[null, <a node>]` raises where the filter this scan
+      // stands in for raises nothing.
+      //
+      // A value no property can hold is settled the same way and for the same reason: nothing
+      // stored equals a graph element, so the filter keeps no row and never asks for the value as a
+      // property. Converting it first would make the query raise only once an index existed.
+      if (relations::equality::HoldsANull(typed_value) || !typed_value.IsPropertyValue()) {
+        return storage::PropertyValueRange::Empty();
+      }
+      auto bounded_property_value = bound_from(typed_value, lower_->type());
       return storage::PropertyValueRange::Bounded(bounded_property_value, bounded_property_value);
     }
 
@@ -217,16 +231,41 @@ auto ExpressionRange::Evaluate(ExpressionEvaluator &evaluator) const -> storage:
     }
 
     case Type::RANGE: {
-      auto lower_bound = to_bounded_property_value(lower_);
-      auto upper_bound = to_bounded_property_value(upper_);
+      // Each bound is read once. Its expression may have side effects or answer differently each
+      // time it is asked, so the value the range is built from has to be the same one its type was
+      // judged on.
+      auto const evaluated = [&](auto const &bound) -> std::optional<TypedValue> {
+        if (bound == std::nullopt) return std::nullopt;
+        return bound->value()->Accept(evaluator);
+      };
+      auto const lower_value = evaluated(lower_);
+      auto const upper_value = evaluated(upper_);
 
-      // When scanning a range, the bounds must be the same type
-      if (lower_bound && upper_bound && !AreComparableTypes(lower_bound->value().type(), upper_bound->value().type())) {
+      // A bound comparability cannot place leaves every ordered comparison answering the same way
+      // for every row, so the filter this scan stands in for keeps none of them. The stored order
+      // places such a value all the same, by where its type sits or by where a NaN is put, and a
+      // band drawn around it would hand back rows no filter would pass.
+      auto const placed_by_comparability = [](auto const &value) {
+        return !value || relations::comparability::Places(*value);
+      };
+      if (!placed_by_comparability(lower_value) || !placed_by_comparability(upper_value)) {
+        return storage::PropertyValueRange::Empty();
+      }
+
+      auto const to_bound = [&](std::optional<TypedValue> const &value,
+                                auto const &bound) -> std::optional<utils::Bound<storage::PropertyValue>> {
+        if (!value) return std::nullopt;
+        return bound_from(*value, bound->type());
+      };
+      auto lower_bound = to_bound(lower_value, lower_);
+      auto upper_bound = to_bound(upper_value, upper_);
+
+      if (lower_bound && upper_bound && !storage::AreComparable(lower_bound->value(), upper_bound->value())) {
         return storage::PropertyValueRange::Invalid(*lower_bound, *upper_bound);
       }
 
       // InMemoryLabelPropertyIndex::Iterable is responsible to make sure an unset lower/upper
-      // bound will be limitted to the same type as the other bound
+      // bound will be limited to the stretch of the order the other bound is compared over
       return storage::PropertyValueRange::Bounded(lower_bound, upper_bound);
     }
 
@@ -239,6 +278,19 @@ auto ExpressionRange::Evaluate(ExpressionEvaluator &evaluator) const -> storage:
 auto ExpressionRange::MakeValuePredicate(ExpressionEvaluator &evaluator) const
     -> storage::PropertyValueRange::ValuePredicate {
   if (!lower_) return nullptr;
+
+  // Only a search term yields a predicate, and the bound has already been read to build the
+  // range. Reading it again for a range that will not use one would repeat whatever the
+  // expression does.
+  switch (type_) {
+    case Type::CONTAINS:
+    case Type::ENDS_WITH:
+    case Type::REGEX_MATCH:
+      break;
+    default:
+      return nullptr;
+  }
+
   auto const typed_value = lower_->value()->Accept(evaluator);
   if (!typed_value.IsString()) return nullptr;
   auto const &search_term = typed_value.ValueString();
@@ -303,8 +355,13 @@ auto ExpressionRange::ResolveAtPlantime(Parameters const &params, storage::NameI
     case Type::IN: {
       auto bounded_property_value = to_bounded_property_value(lower_);
       if (std::holds_alternative<UnknownAtPlanTime>(bounded_property_value)) return std::nullopt;
-      return storage::PropertyValueRange::Bounded(std::get<obpv>(bounded_property_value),
-                                                  std::get<obpv>(bounded_property_value));
+      auto const &bound = std::get<obpv>(bounded_property_value);
+      // The same rule the evaluated form follows: nothing equals a value holding
+      // a Null, so the scan finds nothing and its cost is estimated on that.
+      if (bound && relations::equality::HoldsANull(bound->value())) {
+        return storage::PropertyValueRange::Empty();
+      }
+      return storage::PropertyValueRange::Bounded(bound, bound);
     }
 
     case Type::REGEX_MATCH:
@@ -342,13 +399,12 @@ auto ExpressionRange::ResolveAtPlantime(Parameters const &params, storage::NameI
       auto lower_bound = std::move(std::get<obpv>(maybe_lower_bound));
       auto upper_bound = std::move(std::get<obpv>(maybe_upper_bound));
 
-      // When scanning a range, the bounds must be the same type
-      if (lower_bound && upper_bound && !AreComparableTypes(lower_bound->value().type(), upper_bound->value().type())) {
+      if (lower_bound && upper_bound && !storage::AreComparable(lower_bound->value(), upper_bound->value())) {
         return storage::PropertyValueRange::Invalid(*lower_bound, *upper_bound);
       }
 
       // InMemoryLabelPropertyIndex::Iterable is responsible to make sure an unset lower/upper
-      // bound will be limitted to the same type as the other bound
+      // bound will be limited to the stretch of the order the other bound is compared over
       return storage::PropertyValueRange::Bounded(lower_bound, upper_bound);
     }
 
@@ -1347,52 +1403,31 @@ std::optional<utils::Bound<storage::PropertyValue>> TryConvertToBound(std::optio
                                                                       ExpressionEvaluator &evaluator) {
   if (!bound) return std::nullopt;
   const auto &value = bound->value()->Accept(evaluator);
-  try {
-    const auto &property_value = value.ToPropertyValue(evaluator.GetNameIdMapper());
-    switch (property_value.type()) {
-      case storage::PropertyValue::Type::Bool:
-      case storage::PropertyValue::Type::List:
-      case storage::PropertyValue::Type::NumericList:
-      case storage::PropertyValue::Type::IntList:
-      case storage::PropertyValue::Type::DoubleList:
-      case storage::PropertyValue::Type::Map:
-      case storage::PropertyValue::Type::Enum:
-      case storage::PropertyValueType::Point2d:
-      case storage::PropertyValueType::Point3d:
-      case storage::PropertyValueType::VectorIndexId:
-        // Prevent indexed lookup with something that would fail if we did
-        // the original filter with `operator<`. Note, for some reason,
-        // Cypher does not support comparing boolean values.
-        throw QueryRuntimeException("Range operator does not provide comparison methods for type {}.", value.type());
-      case storage::PropertyValue::Type::Null:
-      case storage::PropertyValue::Type::Int:
-      case storage::PropertyValue::Type::Double:
-      case storage::PropertyValue::Type::String:
-      case storage::PropertyValue::Type::TemporalData:
-      case storage::PropertyValue::Type::ZonedTemporalData:
-        return std::make_optional(utils::Bound<storage::PropertyValue>(property_value, bound->type()));
-    }
-  } catch (const TypedValueException &) {
-    throw QueryRuntimeException("'{}' cannot be used as a property value.", value.type());
+  // A bound comparability cannot place makes the comparison answer the same way for every row, so
+  // the filter this scan stands in for keeps none. A Null bound already says that here, and a bound
+  // the relation cannot place says it the same way rather than raising, which would make the query
+  // fail only once an index existed. Every type it does place is one a property can hold.
+  if (!relations::comparability::Places(value)) {
+    return utils::Bound<storage::PropertyValue>(storage::PropertyValue(), bound->type());
   }
+  return utils::Bound<storage::PropertyValue>(value.ToPropertyValue(evaluator.GetNameIdMapper()), bound->type());
 }
 
-// Helper function to evaluate an expression and convert it to a property value.
 std::optional<storage::PropertyValue> EvaluateExpressionToPropertyValue(Expression *expression, Frame &frame,
                                                                         ExecutionContext &context, storage::View view) {
   ExpressionEvaluator evaluator = ExpressionEvaluator{&frame, context, view, nullptr, &context.number_of_hops};
 
   auto value = expression->Accept(evaluator);
-  if (value.IsNull()) {
+  // Both keep no row, so this scan has to find none. A Null nested in a list or a map counts: the
+  // lookup below compares by a relation holding a Null equal to a Null, and would report a match
+  // the filter does not.
+  if (relations::equality::HoldsANull(value) || !value.IsPropertyValue()) {
     return std::nullopt;
-  }
-  if (!value.IsPropertyValue()) {
-    throw QueryRuntimeException("'{}' cannot be used as a property value.", value.type());
   }
   return value.ToPropertyValue(context.db_accessor->GetStorageAccessor()->GetNameIdMapper());
 }
 
-// Helper function to convert bounds and check for null values.
+// A bound that comes back unset holds for no row, which is not the same as a scan given no bound.
 std::pair<std::optional<utils::Bound<storage::PropertyValue>>, std::optional<utils::Bound<storage::PropertyValue>>>
 ConvertBoundsAndCheckNull(std::optional<utils::Bound<Expression *>> lower_bound,
                           std::optional<utils::Bound<Expression *>> upper_bound, ExpressionEvaluator &evaluator) {
@@ -4173,11 +4208,18 @@ class KShortestPathsCursor : public Cursor {
         current_target_(std::nullopt),
         blocked_edges_(mem),
         blocked_vertices_(mem),
-        distances_(mem),
         in_edges_(mem),
         out_edges_(mem),
-        predecessors_(mem),
-        expansion_memo_(mem) {}
+        trie_first_child_(1, kNoChild, mem),  // node 0 is the empty root, valid from construction
+        trie_children_(mem),
+        path_gids_scratch_(mem),
+        bfs_source_frontier_(mem),
+        bfs_target_frontier_(mem),
+        bfs_source_next_(mem),
+        bfs_target_next_(mem),
+        expansion_memo_(mem),
+        bfs_in_edge_(mem),
+        bfs_out_edge_(mem) {}
 
   bool Pull(Frame &frame, ExecutionContext &context) override {
     OOMExceptionEnabler oom_exception;
@@ -4303,19 +4345,12 @@ class KShortestPathsCursor : public Cursor {
     size_t deviation_vertex_index;  // Index where this path deviates from parent
 
     explicit PathInfo(utils::MemoryResource *mem) : edges(mem), deviation_vertex_index(0) {}
-
-    PathInfo(const utils::pmr::vector<EdgeAccessor> &path_edges, size_t deviation_idx, utils::MemoryResource *mem)
-        : edges(path_edges.begin(), path_edges.end(), mem), deviation_vertex_index(deviation_idx) {}
   };
 
   struct PathComparator {
     bool operator()(const PathInfo &a, const PathInfo &b) const {
-      return a.edges.size() > b.edges.size();  // Min-heap: smaller costs have higher priority
+      return a.edges.size() > b.edges.size();  // Reversed: the heap serves the shortest path first
     }
-  };
-
-  struct EdgeAccessorHash {
-    size_t operator()(const EdgeAccessor &edge) const { return std::hash<storage::Gid>{}(edge.Gid()); }
   };
 
   struct VertexAccessorHash {
@@ -4357,7 +4392,8 @@ class KShortestPathsCursor : public Cursor {
 
   // State for K-shortest paths algorithm
   utils::pmr::vector<PathInfo> shortest_paths_;
-  std::priority_queue<PathInfo, utils::pmr::vector<PathInfo>, PathComparator> candidate_paths_;
+  // A heap by hand, not a `priority_queue`: its `top()` is const, so serving a candidate copies it.
+  utils::pmr::vector<PathInfo> candidate_paths_;
   utils::pmr::unordered_set<utils::pmr::vector<storage::Gid>, PathGidsHash> found_paths_set_;
   size_t current_path_index_ = 0;
 
@@ -4366,10 +4402,11 @@ class KShortestPathsCursor : public Cursor {
   std::optional<VertexAccessor> current_source_;
   std::optional<VertexAccessor> current_target_;
 
-  // Dijkstra's algorithm state (reused for efficiency)
-  utils::pmr::unordered_set<EdgeAccessor, EdgeAccessorHash> blocked_edges_;
-  utils::pmr::unordered_set<VertexAccessor, VertexAccessorHash> blocked_vertices_;
-  utils::pmr::unordered_map<VertexAccessor, double, VertexAccessorHash> distances_;
+  // The inner search skips these. Blocked edges are rebuilt for every deviation; blocked vertices
+  // are the root walked so far, so they only accumulate down the base path. There are no weights:
+  // `PathComparator` orders by hop count.
+  utils::pmr::unordered_set<storage::Gid> blocked_edges_;
+  utils::pmr::unordered_set<storage::Gid> blocked_vertices_;
   // Raw storage adjacency, kept across input rows (unlike `expansion_memo_`) so Yen's repeated inner
   // searches don't re-fetch. Must stay unfiltered: a lambda reading an outer-row value would make
   // post-filter results wrong. Copied into an arena vector because `EdgeVertexAccessorResult` is not
@@ -4378,7 +4415,32 @@ class KShortestPathsCursor : public Cursor {
   using CachedEdges = utils::pmr::vector<EdgeAccessor>;
   utils::pmr::unordered_map<VertexAccessor, CachedEdges, VertexAccessorHash> in_edges_;
   utils::pmr::unordered_map<VertexAccessor, CachedEdges, VertexAccessorHash> out_edges_;
-  utils::pmr::unordered_map<VertexAccessor, std::optional<EdgeAccessor>, VertexAccessorHash> predecessors_;
+
+  // Trie of the found paths' edges: a root prefix's children are exactly the edges a deviation
+  // there must block. Children form an intrusive sibling list, so a node holds no container.
+  static constexpr uint64_t kNoChild = std::numeric_limits<uint64_t>::max();
+
+  struct TrieChild {
+    storage::Gid edge;
+    uint64_t node;
+    uint64_t next_sibling;
+  };
+
+  utils::pmr::vector<uint64_t> trie_first_child_;
+  utils::pmr::vector<TrieChild> trie_children_;
+
+  // Probe buffer for `found_paths_set_`.
+  utils::pmr::vector<storage::Gid> path_gids_scratch_;
+
+  // The inner search's scratch, reused across the searches Yen's runs for one input row instead
+  // of being rebuilt per call. This saves the allocation and the regrowth; it does not fix a leak,
+  // because the arena recycles a pooled block and frees an unpooled one, so a per-call container
+  // was never retained. The reuse only pays within a row, so `ReleaseInnerSearchState` gives the
+  // capacity back at the row boundary.
+  utils::pmr::vector<VertexAccessor> bfs_source_frontier_;
+  utils::pmr::vector<VertexAccessor> bfs_target_frontier_;
+  utils::pmr::vector<VertexAccessor> bfs_source_next_;
+  utils::pmr::vector<VertexAccessor> bfs_target_next_;
 
   // Memoised `access check && filter lambda` verdicts. Sound across Yen's inner searches because the
   // blocked sets - the only per-deviation inputs - are checked outside the memo.
@@ -4388,16 +4450,20 @@ class KShortestPathsCursor : public Cursor {
 
   // Bidirectional search state
   using VertexEdgeMapT = utils::pmr::unordered_map<VertexAccessor, std::optional<EdgeAccessor>>;
+  VertexEdgeMapT bfs_in_edge_;
+  VertexEdgeMapT bfs_out_edge_;
 
   bool InitializeKShortestPaths(const VertexAccessor &source, const VertexAccessor &target, Frame &frame,
                                 ExpressionEvaluator &evaluator, ExecutionContext &context) {
     ResetState();
 
-    // Find the shortest path using Dijkstra's algorithm
+    // Seeds Yen's with the shortest path; the rest are deviations from it.
     auto shortest_path = ComputeShortestPath(source, target, upper_bound_, frame, evaluator, context);
     if (!shortest_path.edges.empty()) {
+      // Recorded before it is reachable as a base path: `ComputeNextShortestPath` walks
+      // `shortest_paths_.back()` down the trie and asserts the walk cannot miss.
+      AddPathToFoundSet(shortest_path);
       shortest_paths_.emplace_back(std::move(shortest_path));
-      AddPathToFoundSet(shortest_paths_.back());
       return true;
     }
     return false;
@@ -4407,115 +4473,95 @@ class KShortestPathsCursor : public Cursor {
                                ExpressionEvaluator &evaluator, ExecutionContext &context) {
     if (shortest_paths_.empty()) return false;
 
-    const auto &last_path = shortest_paths_.back();
+    // Scoped so the reference cannot outlive the loop. Nothing in it appends to
+    // `shortest_paths_`; the scope means that does not have to be re-checked.
+    {
+      const auto &base_path = shortest_paths_.back();
 
-    // Generate candidate paths by deviating at each vertex of the last shortest path
-    for (size_t i = 0UZ; i < last_path.edges.size(); ++i) {
-      GenerateCandidatesFromDeviation(source, target, last_path, i, frame, evaluator, context);
+      // Lawler: start where this path left its parent, not at 0. Its first `first_deviation` edges
+      // are the deviation root it was generated from, and every edge of that root was already a
+      // trie child, so accepting this path can only have added children at `first_deviation` or
+      // deeper - exactly the range below. It has to be the root rather than the parent's prefix,
+      // because one path can be generated at two depths and only the copy popped first sets the
+      // index.
+      const size_t first_deviation = base_path.deviation_vertex_index;
+
+      blocked_vertices_.clear();
+      VertexAccessor deviation_vertex = source;
+      // The base path is itself a found path, so this walk never falls off the trie.
+      uint64_t trie_node = 0;
+
+      for (size_t i = 0UZ; i < base_path.edges.size(); ++i) {
+        if (i >= first_deviation) {
+          blocked_edges_.clear();
+          for (uint64_t c = trie_first_child_[trie_node]; c != kNoChild; c = trie_children_[c].next_sibling) {
+            blocked_edges_.insert(trie_children_[c].edge);
+          }
+          GenerateCandidatesFromDeviation(target, base_path, i, deviation_vertex, frame, evaluator, context);
+        }
+
+        blocked_vertices_.insert(deviation_vertex.Gid());
+        const auto &edge = base_path.edges[i];
+        deviation_vertex = (edge.From() == deviation_vertex) ? edge.To() : edge.From();
+        trie_node = TrieDescend(trie_node, edge.Gid());
+        // Checked in release too: a miss is `kNoChild`, and the next iteration would index the
+        // child array with it.
+        MG_ASSERT(trie_node != kNoChild, "the base path must be in the trie of found paths");
+      }
     }
 
     // Find the best candidate path
     while (!candidate_paths_.empty()) {
-      PathInfo candidate = candidate_paths_.top();
-      candidate_paths_.pop();
+      std::ranges::pop_heap(candidate_paths_, PathComparator{});
+      // `const` here would bind the `std::move` below to the copy constructor rather than the
+      // move, which is the copy this operator exists to avoid. The check cannot see that through
+      // a pmr container's allocator-aware construction.
+      // NOLINTNEXTLINE(misc-const-correctness)
+      PathInfo candidate = std::move(candidate_paths_.back());
+      candidate_paths_.pop_back();
       // Handle upper bound
       if (candidate.edges.size() > upper_bound_) {
         // Next path is too long, stop generating candidates
         return false;
       }
       if (!IsPathInFoundSet(candidate)) {
+        AddPathToFoundSet(candidate);
         shortest_paths_.emplace_back(std::move(candidate));
-        AddPathToFoundSet(shortest_paths_.back());
         return true;
       }
     }
     return false;
   }
 
-  void GenerateCandidatesFromDeviation(const VertexAccessor &source, const VertexAccessor &target,
-                                       const PathInfo &base_path, size_t deviation_index, Frame &frame,
+  void GenerateCandidatesFromDeviation(const VertexAccessor &target, const PathInfo &base_path, size_t deviation_index,
+                                       const VertexAccessor &deviation_vertex, Frame &frame,
                                        ExpressionEvaluator &evaluator, ExecutionContext &context) {
-    // Set up blocked edges and vertices for this deviation
-    SetupBlockedElementsForDeviation(source, base_path, deviation_index);
-
-    // Get the deviation vertex
-    VertexAccessor deviation_vertex = GetVertexAtIndex(source, base_path, deviation_index);
-
     // The candidate's total is `deviation_index + spur_len`, so the spur gets what's left of it.
     auto spur_path = ComputeShortestPath(
         deviation_vertex, target, upper_bound_ - static_cast<int64_t>(deviation_index), frame, evaluator, context);
 
-    if (!spur_path.edges.empty()) {
-      // Combine the root path (up to deviation) with the spur path
-      PathInfo candidate_path(evaluator.GetMemoryResource());
+    if (spur_path.edges.empty()) return;
 
-      // Add edges from source to deviation vertex
-      for (size_t i = 0UZ; i < deviation_index; ++i) {
-        candidate_path.edges.push_back(base_path.edges[i]);
-      }
+    // Reserved because the final size is known: one allocation instead of a realloc chain.
+    PathInfo candidate_path(evaluator.GetMemoryResource());
+    candidate_path.edges.reserve(deviation_index + spur_path.edges.size());
+    candidate_path.edges.assign(base_path.edges.begin(),
+                                base_path.edges.begin() + static_cast<std::ptrdiff_t>(deviation_index));
+    candidate_path.edges.insert(candidate_path.edges.end(), spur_path.edges.begin(), spur_path.edges.end());
+    candidate_path.deviation_vertex_index = deviation_index;
 
-      // Add spur path edges
-      for (const auto &edge : spur_path.edges) {
-        candidate_path.edges.push_back(edge);
-      }
-
-      candidate_path.deviation_vertex_index = deviation_index;
-
-      candidate_paths_.push(std::move(candidate_path));
-    }
+    candidate_paths_.push_back(std::move(candidate_path));
+    std::ranges::push_heap(candidate_paths_, PathComparator{});
   }
 
-  void SetupBlockedElementsForDeviation(const VertexAccessor &source, const PathInfo &base_path,
-                                        size_t deviation_index) {
-    blocked_edges_.clear();
-    blocked_vertices_.clear();
-
-    // Block the edge at deviation index from all previously found paths that share the same prefix
-    for (const auto &path : shortest_paths_) {
-      if (deviation_index < path.edges.size()) {
-        // Check if the path prefix matches up to deviation index
-        bool prefix_matches = true;
-        for (size_t i = 0UZ; i < deviation_index; ++i) {
-          if (i >= base_path.edges.size() || path.edges[i].Gid() != base_path.edges[i].Gid()) {
-            prefix_matches = false;
-            break;
-          }
-        }
-
-        if (prefix_matches) {
-          blocked_edges_.insert(path.edges[deviation_index]);
-        }
-      }
-    }
-
-    // Block vertices in the root path (except the deviation vertex)
-    VertexAccessor current_vertex = source;
-    for (size_t i = 0UZ; i < deviation_index; ++i) {
-      blocked_vertices_.insert(current_vertex);
-      const auto &edge = base_path.edges[i];
-      current_vertex = (edge.From() == current_vertex) ? edge.To() : edge.From();
-    }
-  }
-
-  static VertexAccessor GetVertexAtIndex(const VertexAccessor &source, const PathInfo &path, size_t index) {
-    if (index == 0) return source;
-
-    VertexAccessor current = source;
-    for (size_t i = 0UZ; i < index && i < path.edges.size(); ++i) {
-      const auto &edge = path.edges[i];
-      current = (edge.From() == current) ? edge.To() : edge.From();
-    }
-    return current;
-  }
-
-  static PathInfo ReconstructPath(const VertexAccessor &midpoint, const VertexEdgeMapT &in_edge,
-                                  const VertexEdgeMapT &out_edge, utils::MemoryResource *memory) {
-    utils::pmr::vector<EdgeAccessor> result(memory);
+  PathInfo ReconstructPath(const VertexAccessor &midpoint, utils::MemoryResource *memory) const {
+    PathInfo out(memory);
+    auto &result = out.edges;
     VertexAccessor current = midpoint;
 
     // Reconstruct the path from midpoint to source
-    while (in_edge.contains(current)) {
-      const auto &edge_opt = in_edge.at(current);
+    while (bfs_in_edge_.contains(current)) {
+      const auto &edge_opt = bfs_in_edge_.at(current);
       if (edge_opt) {
         const auto &edge = edge_opt.value();
         result.push_back(edge);
@@ -4530,8 +4576,8 @@ class KShortestPathsCursor : public Cursor {
 
     // Reconstruct the path from midpoint to target
     current = midpoint;
-    while (out_edge.contains(current)) {
-      const auto &edge_opt = out_edge.at(current);
+    while (bfs_out_edge_.contains(current)) {
+      const auto &edge_opt = bfs_out_edge_.at(current);
       if (edge_opt) {
         const auto &edge = edge_opt.value();
         result.push_back(edge);
@@ -4541,7 +4587,7 @@ class KShortestPathsCursor : public Cursor {
       }
     }
 
-    return PathInfo(result, 0, memory);
+    return out;
   }
 
   static constexpr bool kTo = true;
@@ -4594,7 +4640,8 @@ class KShortestPathsCursor : public Cursor {
   bool ShouldExpand(const EdgeAccessor &edge, const VertexAccessor &expand_from, const VertexEdgeMapT &reached,
                     Frame &frame, ExpressionEvaluator &evaluator, ExecutionContext &context) {
     const VertexAccessor next = To == kTo ? edge.To() : edge.From();
-    if (blocked_edges_.contains(edge) || blocked_vertices_.contains(next) || reached.contains(next)) return false;
+    if (blocked_edges_.contains(edge.Gid()) || blocked_vertices_.contains(next.Gid()) || reached.contains(next))
+      return false;
 
     const VertexAccessor &inner_node = Backward ? expand_from : next;
     // Access check first: an edge the user cannot read must never make the lambda run on it.
@@ -4623,28 +4670,19 @@ class KShortestPathsCursor : public Cursor {
     // perform better for real-world like graphs where the expansion front
     // grows exponentially, effectively reducing the exponent by half.
 
-    auto *pull_memory = evaluator.GetMemoryResource();
-    // Holds vertices at the current level of expansion from the source
-    // (target).
-    utils::pmr::vector<VertexAccessor> source_frontier(pull_memory);
-    utils::pmr::vector<VertexAccessor> target_frontier(pull_memory);
-
-    // Holds vertices we can expand to from `source_frontier`
-    // (`target_frontier`).
-    utils::pmr::vector<VertexAccessor> source_next(pull_memory);
-    utils::pmr::vector<VertexAccessor> target_next(pull_memory);
-
-    // Maps each vertex we visited expanding from the source (target) to the
-    // edge used. Necessary for path reconstruction.
-    VertexEdgeMapT in_edge(pull_memory);
-    VertexEdgeMapT out_edge(pull_memory);
+    bfs_source_frontier_.clear();
+    bfs_target_frontier_.clear();
+    bfs_source_next_.clear();
+    bfs_target_next_.clear();
+    bfs_in_edge_.clear();
+    bfs_out_edge_.clear();
 
     size_t current_length = 0;
 
-    source_frontier.emplace_back(source);
-    in_edge[source] = std::nullopt;
-    target_frontier.emplace_back(target);
-    out_edge[target] = std::nullopt;
+    bfs_source_frontier_.emplace_back(source);
+    bfs_in_edge_[source] = std::nullopt;
+    bfs_target_frontier_.emplace_back(target);
+    bfs_out_edge_[target] = std::nullopt;
 
     while (true) {
       AbortCheck(context);
@@ -4652,7 +4690,7 @@ class KShortestPathsCursor : public Cursor {
       ++current_length;
       if (std::cmp_greater(current_length, upper_bound)) return PathInfo(evaluator.GetMemoryResource());
 
-      for (const auto &vertex : source_frontier) {
+      for (const auto &vertex : bfs_source_frontier_) {
         if (context.hops_limit.IsLimitReached()) break;
         if (self_.common_.direction != EdgeAtom::Direction::IN) {
           if (!out_edges_.contains(vertex)) {
@@ -4665,14 +4703,14 @@ class KShortestPathsCursor : public Cursor {
                                            out_edges_.get_allocator().resource()));
           }
           for (const auto &edge : out_edges_.at(vertex)) {
-            if (!ShouldExpand<kTo, kForward>(edge, vertex, in_edge, frame, evaluator, context)) {
+            if (!ShouldExpand<kTo, kForward>(edge, vertex, bfs_in_edge_, frame, evaluator, context)) {
               continue;
             }
-            in_edge.emplace(edge.To(), edge);
-            if (out_edge.contains(edge.To())) {
-              return ReconstructPath(edge.To(), in_edge, out_edge, evaluator.GetMemoryResource());
+            bfs_in_edge_.emplace(edge.To(), edge);
+            if (bfs_out_edge_.contains(edge.To())) {
+              return ReconstructPath(edge.To(), evaluator.GetMemoryResource());
             }
-            source_next.push_back(edge.To());
+            bfs_source_next_.push_back(edge.To());
           }
         }
         if (self_.common_.direction != EdgeAtom::Direction::OUT) {
@@ -4686,21 +4724,21 @@ class KShortestPathsCursor : public Cursor {
                     in_edges_result.edges.begin(), in_edges_result.edges.end(), in_edges_.get_allocator().resource()));
           }
           for (const auto &edge : in_edges_.at(vertex)) {
-            if (!ShouldExpand<kFrom, kForward>(edge, vertex, in_edge, frame, evaluator, context)) {
+            if (!ShouldExpand<kFrom, kForward>(edge, vertex, bfs_in_edge_, frame, evaluator, context)) {
               continue;
             }
-            in_edge.emplace(edge.From(), edge);
-            if (out_edge.contains(edge.From())) {
-              return ReconstructPath(edge.From(), in_edge, out_edge, evaluator.GetMemoryResource());
+            bfs_in_edge_.emplace(edge.From(), edge);
+            if (bfs_out_edge_.contains(edge.From())) {
+              return ReconstructPath(edge.From(), evaluator.GetMemoryResource());
             }
-            source_next.push_back(edge.From());
+            bfs_source_next_.push_back(edge.From());
           }
         }
       }
 
-      if (source_next.empty()) return PathInfo(evaluator.GetMemoryResource());
-      source_frontier.clear();
-      std::swap(source_frontier, source_next);
+      if (bfs_source_next_.empty()) return PathInfo(evaluator.GetMemoryResource());
+      bfs_source_frontier_.clear();
+      std::swap(bfs_source_frontier_, bfs_source_next_);
 
       // Bottom-up step (expansion from the target).
       ++current_length;
@@ -4709,7 +4747,7 @@ class KShortestPathsCursor : public Cursor {
       // When expanding from the target we have to be careful which edge
       // endpoint we pass to `should_expand`, because everything is
       // reversed.
-      for (const auto &vertex : target_frontier) {
+      for (const auto &vertex : bfs_target_frontier_) {
         if (context.hops_limit.IsLimitReached()) break;
         if (self_.common_.direction != EdgeAtom::Direction::OUT) {
           if (!out_edges_.contains(vertex)) {
@@ -4722,14 +4760,14 @@ class KShortestPathsCursor : public Cursor {
                                            out_edges_.get_allocator().resource()));
           }
           for (const auto &edge : out_edges_.at(vertex)) {
-            if (!ShouldExpand<kTo, kBackward>(edge, vertex, out_edge, frame, evaluator, context)) {
+            if (!ShouldExpand<kTo, kBackward>(edge, vertex, bfs_out_edge_, frame, evaluator, context)) {
               continue;
             }
-            out_edge.emplace(edge.To(), edge);
-            if (in_edge.contains(edge.To())) {
-              return ReconstructPath(edge.To(), in_edge, out_edge, evaluator.GetMemoryResource());
+            bfs_out_edge_.emplace(edge.To(), edge);
+            if (bfs_in_edge_.contains(edge.To())) {
+              return ReconstructPath(edge.To(), evaluator.GetMemoryResource());
             }
-            target_next.push_back(edge.To());
+            bfs_target_next_.push_back(edge.To());
           }
         }
         if (self_.common_.direction != EdgeAtom::Direction::IN) {
@@ -4743,21 +4781,21 @@ class KShortestPathsCursor : public Cursor {
                     in_edges_result.edges.begin(), in_edges_result.edges.end(), in_edges_.get_allocator().resource()));
           }
           for (const auto &edge : in_edges_.at(vertex)) {
-            if (!ShouldExpand<kFrom, kBackward>(edge, vertex, out_edge, frame, evaluator, context)) {
+            if (!ShouldExpand<kFrom, kBackward>(edge, vertex, bfs_out_edge_, frame, evaluator, context)) {
               continue;
             }
-            out_edge.emplace(edge.From(), edge);
-            if (in_edge.contains(edge.From())) {
-              return ReconstructPath(edge.From(), in_edge, out_edge, evaluator.GetMemoryResource());
+            bfs_out_edge_.emplace(edge.From(), edge);
+            if (bfs_in_edge_.contains(edge.From())) {
+              return ReconstructPath(edge.From(), evaluator.GetMemoryResource());
             }
-            target_next.push_back(edge.From());
+            bfs_target_next_.push_back(edge.From());
           }
         }
       }
 
-      if (target_next.empty()) return PathInfo(evaluator.GetMemoryResource());
-      target_frontier.clear();
-      std::swap(target_frontier, target_next);
+      if (bfs_target_next_.empty()) return PathInfo(evaluator.GetMemoryResource());
+      bfs_target_frontier_.clear();
+      std::swap(bfs_target_frontier_, bfs_target_next_);
     }
   }
 
@@ -4771,34 +4809,78 @@ class KShortestPathsCursor : public Cursor {
   }
 
   bool IsPathInFoundSet(const PathInfo &path) {
-    utils::pmr::vector<storage::Gid> path_gids(found_paths_set_.get_allocator());
+    path_gids_scratch_.clear();
     for (const auto &edge : path.edges) {
-      path_gids.push_back(edge.Gid());
+      path_gids_scratch_.push_back(edge.Gid());
     }
-    return found_paths_set_.contains(path_gids);
+    return found_paths_set_.contains(path_gids_scratch_);
   }
 
   void AddPathToFoundSet(const PathInfo &path) {
     utils::pmr::vector<storage::Gid> path_gids(found_paths_set_.get_allocator());
+    path_gids.reserve(path.edges.size());
     for (const auto &edge : path.edges) {
       path_gids.push_back(edge.Gid());
     }
     found_paths_set_.insert(std::move(path_gids));
+
+    uint64_t node = 0;
+    for (const auto &edge : path.edges) {
+      node = TrieDescendOrCreate(node, edge.Gid());
+    }
+  }
+
+  /// The child of `node` reached by `edge`, created if this is the first path to take it.
+  uint64_t TrieDescendOrCreate(uint64_t node, storage::Gid edge) {
+    for (uint64_t c = trie_first_child_[node]; c != kNoChild; c = trie_children_[c].next_sibling) {
+      if (trie_children_[c].edge == edge) return trie_children_[c].node;
+    }
+    // Ids are as wide as the vector's own index, so `fresh` cannot narrow and the only ceiling
+    // left is the sentinel - which a vector of these cannot reach before the allocator gives out.
+    const auto fresh = static_cast<uint64_t>(trie_first_child_.size());
+    trie_first_child_.push_back(kNoChild);
+    trie_children_.push_back(TrieChild{.edge = edge, .node = fresh, .next_sibling = trie_first_child_[node]});
+    trie_first_child_[node] = trie_children_.size() - 1;
+    return fresh;
+  }
+
+  /// The child of `node` reached by `edge`; `kNoChild` when no found path took it.
+  uint64_t TrieDescend(uint64_t node, storage::Gid edge) const {
+    for (uint64_t c = trie_first_child_[node]; c != kNoChild; c = trie_children_[c].next_sibling) {
+      if (trie_children_[c].edge == edge) return trie_children_[c].node;
+    }
+    return kNoChild;
   }
 
   void ResetState() {
     shortest_paths_.clear();
-    while (!candidate_paths_.empty()) candidate_paths_.pop();
+    candidate_paths_.clear();
     found_paths_set_.clear();
     current_path_index_ = 0;
     blocked_edges_.clear();
     blocked_vertices_.clear();
-    distances_.clear();
-    predecessors_.clear();
+    trie_children_.clear();
+    trie_first_child_.assign(1, kNoChild);  // node 0 is the empty root
     // Cleared per input row: the lambda may read outer variables, so verdicts don't survive a row.
     expansion_memo_.clear();
+    ReleaseInnerSearchState();
     // Makes `|K` per input row; `Pull` guards each serving site instead of returning early.
     n_returned_paths_ = 0;
+  }
+
+  // Releases the inner search's scratch instead of just emptying it. `clear()` keeps a hash
+  // table's bucket array and a vector's capacity, so without this one expensive row would leave
+  // every later search sweeping buckets sized for a search it never runs, and hold that memory for
+  // the life of the cursor. Called per row, so the reuse within a row still stands.
+  void ReleaseInnerSearchState() {
+    for (auto *frontier : {&bfs_source_frontier_, &bfs_target_frontier_, &bfs_source_next_, &bfs_target_next_}) {
+      frontier->clear();
+      frontier->shrink_to_fit();
+    }
+    for (auto *reached : {&bfs_in_edge_, &bfs_out_edge_}) {
+      reached->clear();
+      reached->rehash(0);
+    }
   }
 };
 
@@ -5128,6 +5210,17 @@ std::string Filter::SingleFilterName(FilterInfo const &single_filter) {
     case Type::Pattern: {
       return "Pattern";
     }
+    case Type::Node: {
+      // Written over the identifier of an already-bound node, so that name is the whole of what there is to
+      // say. Any other shape has no name to print, and an unnamed filter beats refusing to show a plan.
+      if (single_filter.expression->GetTypeInfo() == LabelsTest::kType) {
+        const auto *filter_expression = static_cast<LabelsTest *>(single_filter.expression);
+        if (filter_expression->expression_->GetTypeInfo() == Identifier::kType) {
+          return fmt::format("({})", static_cast<Identifier *>(filter_expression->expression_)->name_);
+        }
+      }
+      return "()";
+    }
     case Type::Point: {
       return fmt::format(
           "{{{}.{}}}", single_filter.point_filter->symbol_.name(), single_filter.point_filter->property_.name);
@@ -5147,9 +5240,10 @@ std::string Filter::SingleFilterName(FilterInfo const &single_filter) {
       const auto *identifier_expression = static_cast<Identifier *>(filter_expression->expression_);
       return fmt::format("[{} :{}]", identifier_expression->name_, or_edge_types);
     }
-    default:
-      LOG_FATAL("Unexpected FilterInfo::Type");
   }
+  // No default label above, so a filter kind added without a case here is a compile error. Reaching this line
+  // needs a value outside the enumeration, which no code can produce.
+  LOG_FATAL("Unexpected FilterInfo::Type");
 }
 
 std::string Filter::ToString(const DbAccessor * /*dba*/) const {
@@ -8879,6 +8973,8 @@ class CallProcedureCursor : public Cursor {
   bool stream_exhausted{true};
   bool call_initializer{false};
   std::optional<std::function<void()>> cleanup_{std::nullopt};
+  // Whether the module holds state for a stream this cursor started and has not torn down yet.
+  bool cleanup_pending_{false};
 
  public:
   CallProcedureCursor(const CallProcedure *self, utils::MemoryResource *mem,
@@ -8953,22 +9049,20 @@ class CallProcedureCursor : public Cursor {
       }
       if (stream_exhausted) {
         if (!input_cursor_->Pull(frame, context)) {
-          if (proc_->cleanup) {
-            const utils::MemoryTracker::RefusalHandledScope refusal_handled;
-            proc_->cleanup.value()();
-          }
+          RunCleanup();
           return false;
         }
         stream_exhausted = false;
+        // A reset leaves the previous row's stream live; starting a new one tears it down.
+        RunCleanup();
         if (proc_->initializer) {
           call_initializer = true;
           MG_ASSERT(proc_->cleanup);
-          const utils::MemoryTracker::RefusalHandledScope refusal_handled;
-          proc_->cleanup.value()();
         }
-      }
-      if (!cleanup_ && proc_->cleanup) [[unlikely]] {
-        cleanup_.emplace(*proc_->cleanup);
+        if (proc_->cleanup) [[unlikely]] {
+          if (!cleanup_) cleanup_.emplace(*proc_->cleanup);
+          cleanup_pending_ = true;
+        }
       }
       result_.rows.clear();
 
@@ -9042,17 +9136,54 @@ class CallProcedureCursor : public Cursor {
   void Reset() override {
     result_.rows.clear();
     result_row_it_ = result_.rows.begin();
-    if (cleanup_) {
-      const utils::MemoryTracker::RefusalHandledScope refusal_handled;
-      cleanup_.value()();
-    }
+    // true == "no live stream, pull a fresh input row first". The interrupted stream is torn down by
+    // whichever comes first: the next Pull's cleanup, `Shutdown`, or this cursor's destructor.
+    stream_exhausted = true;
+    call_initializer = false;
+    input_cursor_->Reset();
   }
 
   void Shutdown() override {
-    if (cleanup_) {
-      const utils::MemoryTracker::RefusalHandledScope refusal_handled;
-      cleanup_.value()();
+    // The input has to be shut down even when the module's cleanup throws, or one throwing module
+    // skips the teardown of everything below it. Both calls are sequenced here rather than guarding
+    // the second with a scope guard, because a scope guard would run the input's shutdown from a
+    // destructor while the cleanup's exception was propagating, and a throw out of a destructor
+    // during unwinding aborts the process.
+    std::exception_ptr cleanup_failure;
+    try {
+      RunCleanup();
+    } catch (...) {
+      cleanup_failure = std::current_exception();
     }
+    try {
+      input_cursor_->Shutdown();
+    } catch (...) {
+      if (!cleanup_failure) throw;
+      // Only one can be reported. Keep the cleanup's, which is the one this cursor is responsible for.
+      spdlog::warn("Ignoring a shutdown failure below '{}', which failed to clean up itself", self_->procedure_name_);
+    }
+    if (cleanup_failure) std::rethrow_exception(cleanup_failure);
+  }
+
+  // A query that ends in an exception never reaches `Shutdown`, so this is the only teardown an
+  // aborted stream gets. Destructors may not throw, and the module's cleanup is arbitrary code.
+  ~CallProcedureCursor() override {
+    try {
+      RunCleanup();
+    } catch (const std::exception &e) {
+      spdlog::warn("Ignoring an exception from the cleanup of '{}': {}", self_->procedure_name_, e.what());
+    } catch (...) {
+      spdlog::warn("Ignoring an unknown exception from the cleanup of '{}'", self_->procedure_name_);
+    }
+  }
+
+ private:
+  // Runs the module's cleanup if a stream is live, at most once per stream.
+  void RunCleanup() {
+    if (!cleanup_pending_) return;
+    cleanup_pending_ = false;
+    const utils::MemoryTracker::RefusalHandledScope refusal_handled;
+    cleanup_.value()();
   }
 };
 
@@ -9831,7 +9962,7 @@ class HashJoinCursor : public Cursor {
             ExpressionEvaluator{&frame, context, storage::View::OLD, nullptr, &context.number_of_hops};
 
         auto right_value = self_.hash_join_condition_->expression2_->Accept(evaluator);
-        if (hashtable_.contains(right_value)) {
+        if (!relations::equality::HoldsANull(right_value) && hashtable_.contains(right_value)) {
           // If so, finish pulling for now and proceed to joining the pulled frame
           right_op_frame_.assign(frame.elems().begin(), frame.elems().end());
           common_value_found_ = true;
@@ -9880,7 +10011,11 @@ class HashJoinCursor : public Cursor {
           ExpressionEvaluator{&frame, context, storage::View::OLD, nullptr, &context.number_of_hops};
 
       auto left_value = self_.hash_join_condition_->expression1_->Accept(evaluator);
-      if (left_value.type() != TypedValue::Type::Null) {
+      // A join keeps a pair only where the equality it stands for is true, and
+      // an equality against a value holding a Null is never true. Such a row
+      // joins with nothing, so it is not offered to the table at all. The
+      // filter this join replaced would have dropped it too.
+      if (!relations::equality::HoldsANull(left_value)) {
         hashtable_[left_value].emplace_back(frame.elems().begin(), frame.elems().end());
       }
     }
@@ -10770,7 +10905,9 @@ UniqueCursorPtr ScanParallelByLabelProperties::MakeCursor(utils::MemoryResource 
                                                           metrics::DatabaseMetricHandles &metric_handles) const {
   metric_handles.scan_all_by_label_properties_operator.Increment();
 #ifdef MG_ENTERPRISE
-  auto get_chunks = [this](Frame &frame, ExecutionContext &context) {
+  // The predicates outlive the row they were built from; see ExpressionRange::MakeValuePredicate.
+  auto get_chunks = [this, value_predicates = std::vector<storage::PropertyValueRange::ValuePredicate>{}](
+                        Frame &frame, ExecutionContext &context) mutable {
     auto *db = context.db_accessor;
     ExpressionEvaluator evaluator = ExpressionEvaluator{&frame, context, view_, nullptr, &context.number_of_hops};
 
@@ -10779,6 +10916,19 @@ UniqueCursorPtr ScanParallelByLabelProperties::MakeCursor(utils::MemoryResource 
       return db->ChunkedVertices(
           view_, label_, properties_, std::vector<storage::PropertyValueRange>{}, 0, index_order_);
     }
+
+    // Carried on the range exactly as the serial scan carries it. Without it every value in the
+    // band is handed to the filter above, which is most of the column for a search term.
+    if (value_predicates.size() != expression_ranges_.size()) {
+      value_predicates = expression_ranges_ | rv::transform([&](ExpressionRange const &expression_range) {
+                           return expression_range.MakeValuePredicate(evaluator);
+                         }) |
+                         ranges::to_vector;
+    }
+    for (auto &&[range, predicate] : rv::zip(*maybe_prop_value_ranges, value_predicates)) {
+      range.SetValuePredicate(predicate);
+    }
+
     return db->ChunkedVertices(view_, label_, properties_, *maybe_prop_value_ranges, num_threads_, index_order_);
   };
   return MakeUniqueCursorPtr<ScanParallelCursor<decltype(get_chunks)>>(
@@ -10883,6 +11033,10 @@ UniqueCursorPtr ScanParallelByEdgeTypePropertyRange::MakeCursor(utils::MemoryRes
     ExpressionEvaluator evaluator = ExpressionEvaluator{&frame, context, view_, nullptr, &context.number_of_hops};
 
     auto [maybe_lower, maybe_upper] = ConvertBoundsAndCheckNull(lower_bound_, upper_bound_, evaluator);
+    // No chunks is how a scan that finds nothing is asked for here.
+    if (!maybe_lower && !maybe_upper) {
+      return db->ChunkedEdges(view_, edge_type_, property_, std::nullopt, std::nullopt, 0);
+    }
     return db->ChunkedEdges(view_, edge_type_, property_, maybe_lower, maybe_upper, num_threads_);
   };
   return MakeUniqueCursorPtr<ScanParallelCursor<decltype(get_chunks)>>(
@@ -11020,6 +11174,10 @@ UniqueCursorPtr ScanParallelByEdgePropertyRange::MakeCursor(utils::MemoryResourc
     ExpressionEvaluator evaluator = ExpressionEvaluator{&frame, context, view_, nullptr, &context.number_of_hops};
 
     auto [maybe_lower, maybe_upper] = ConvertBoundsAndCheckNull(lower_bound_, upper_bound_, evaluator);
+    // No chunks is how a scan that finds nothing is asked for here.
+    if (!maybe_lower && !maybe_upper) {
+      return db->ChunkedEdges(view_, property_, std::nullopt, std::nullopt, 0);
+    }
     return db->ChunkedEdges(view_, property_, maybe_lower, maybe_upper, num_threads_);
   };
   return MakeUniqueCursorPtr<ScanParallelCursor<decltype(get_chunks)>>(

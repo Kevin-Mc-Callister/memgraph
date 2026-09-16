@@ -45,6 +45,7 @@ env:
   OS: ${{ inputs.os }}
   PYTHON_BUILD_VERSION: ${{ inputs.python_build_version }}
   PYTHON_RUNTIME_VERSION: ${{ inputs.python_runtime_version }}
+  ABI3_REWRITE_FLAG: ${{ (inputs.python_build_version == '' && inputs.python_runtime_version == '') && '--no-abi3-rewrite' || '' }}
   TOOLCHAIN: v8
   CONAN_REMOTE: ${{ secrets.CONAN_REMOTE }}
   CONAN_USERNAME: ${{ secrets.CONAN_USERNAME }}
@@ -103,8 +104,6 @@ jobs:
 
       - name: Build debug binary
         run: |
-          LINK_THREADS=$(./tools/ci/compute-build-threads.sh 3.5)
-          echo "Linking with $LINK_THREADS threads"
           ./release/package/mgbuild.sh \
           --toolchain $TOOLCHAIN \
           --os $OS \
@@ -112,9 +111,11 @@ jobs:
           --build-type $BUILD_TYPE \
           --threads 12 \
           build-memgraph \
-          --link-threads $LINK_THREADS \
+          --memory-per-compile-job-mb 3500 \
+          --memory-per-link-job-mb 700 \
           ${PYTHON_BUILD_VERSION:+--python-build-version $PYTHON_BUILD_VERSION} \
           ${PYTHON_RUNTIME_VERSION:+--python-runtime-version $PYTHON_RUNTIME_VERSION} \
+          $ABI3_REWRITE_FLAG \
           --conan-remote $CONAN_REMOTE \
           --conan-username $CONAN_USERNAME \
           --conan-password $CONAN_PASSWORD
@@ -278,8 +279,6 @@ jobs:
 
       - name: Build debug binary
         run: |
-          LINK_THREADS=$(./tools/ci/compute-build-threads.sh 3.5)
-          echo "Linking with $LINK_THREADS threads"
           ./release/package/mgbuild.sh \
           --toolchain $TOOLCHAIN \
           --os $OS \
@@ -287,9 +286,11 @@ jobs:
           --build-type $BUILD_TYPE \
           --threads 12 \
           build-memgraph \
-          --link-threads $LINK_THREADS \
+          --memory-per-compile-job-mb 3500 \
+          --memory-per-link-job-mb 700 \
           ${PYTHON_BUILD_VERSION:+--python-build-version $PYTHON_BUILD_VERSION} \
           ${PYTHON_RUNTIME_VERSION:+--python-runtime-version $PYTHON_RUNTIME_VERSION} \
+          $ABI3_REWRITE_FLAG \
           --conan-remote $CONAN_REMOTE \
           --conan-username $CONAN_USERNAME \
           --conan-password $CONAN_PASSWORD
@@ -314,7 +315,7 @@ jobs:
           --monitoring-host $MONITORING_HOST \
           --cluster-id $CLUSTER_ID \
           --cluster-env $CLUSTER_ENV \
-          test-memgraph integration
+          test-memgraph integration-parallel
 
       - name: Collect core dumps
         if: failure()
