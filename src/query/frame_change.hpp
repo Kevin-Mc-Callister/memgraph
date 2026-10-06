@@ -15,6 +15,7 @@
 #include <tuple>
 #include <utility>
 #include "query/frontend/ast/query/named_expression.hpp"
+#include "query/relations/equality.hpp"
 #include "query/typed_value.hpp"
 #include "utils/memory.hpp"
 #include "utils/pmr/unordered_map.hpp"
@@ -31,11 +32,19 @@ struct CachedSet {
   absl::flat_hash_set<TypedValue, absl::DefaultHashContainerHash<TypedValue>, TypedValue::BoolEqual, allocator_type>
       cache_;
 
+  /// Whether a lookup here answers the equality question `IN` asks.
+  ///
+  /// The set is keyed by equivalence, which holds a pair alike that equality leaves undecided or
+  /// answers false. The two part company over an element holding a Null or a NaN.
+  bool answers_equality_{true};
+
   explicit CachedSet(allocator_type alloc) : cache_{alloc} {}
 
-  CachedSet(const CachedSet &other, allocator_type alloc) : cache_(other.cache_, alloc) {}
+  CachedSet(const CachedSet &other, allocator_type alloc)
+      : cache_(other.cache_, alloc), answers_equality_(other.answers_equality_) {}
 
-  CachedSet(CachedSet &&other, allocator_type alloc) : cache_(std::move(other.cache_), alloc) {}
+  CachedSet(CachedSet &&other, allocator_type alloc)
+      : cache_(std::move(other.cache_), alloc), answers_equality_(other.answers_equality_) {}
 
   CachedSet(CachedSet &&other) noexcept : CachedSet(std::move(other), other.get_allocator()) {}
 
@@ -49,7 +58,10 @@ struct CachedSet {
 
   ~CachedSet() = default;
 
-  void Reset() { cache_.clear(); }
+  void Reset() {
+    cache_.clear();
+    answers_equality_ = true;
+  }
 
   bool SetValue(const TypedValue &maybe_list) {
     if (!maybe_list.IsList()) {
@@ -57,6 +69,12 @@ struct CachedSet {
     }
     const auto &list = maybe_list.ValueList();
     for (const auto &element : list) {
+      // An element that equality does not hold equal to itself costs the set its exactness: a
+      // lookup reports it present where equality would answer Null, for an element holding a
+      // Null, or false, for one holding a NaN.
+      //
+      // A top-level Null is the exception, answered by the explicit lookup for one.
+      if (!element.IsNull() && !relations::equality::EqualsItself(element)) answers_equality_ = false;
       cache_.insert(element);
     }
     return true;
@@ -64,6 +82,9 @@ struct CachedSet {
 
   // Func to check if cache_ contains value
   bool Contains(const TypedValue &value) const { return cache_.contains(value); }
+
+  /// Whether a lookup here answers the equality question `IN` asks.
+  bool AnswersEquality() const { return answers_equality_; }
 };
 
 // Class tracks keys for which user can cache values which help with faster search or faster retrieval
@@ -174,6 +195,11 @@ class FrameChangeCollector {
     // Merge inlist_cache_: combine cached values (union of sets)
     for (auto &&[key, cached_set] : other.inlist_cache_) {
       auto [it, inserted] = inlist_cache_.emplace(key, CachedSet(get_allocator()));
+      // Whether a lookup still answers equality is a property of what the set holds, and the
+      // merged set holds what both sides held. Inserting the values below goes around SetValue,
+      // which is where that is worked out, so it is carried over here instead: exactness survives
+      // only where neither side lost it.
+      it->second.answers_equality_ = it->second.answers_equality_ && cached_set.answers_equality_;
       // Merge the cached values (union of sets) - works for both new and existing keys
       for (auto &&value : cached_set.cache_) {
         it->second.cache_.emplace(value);

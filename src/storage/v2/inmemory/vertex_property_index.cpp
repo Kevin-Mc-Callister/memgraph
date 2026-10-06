@@ -15,12 +15,11 @@
 #include "storage/v2/id_types.hpp"
 #include "storage/v2/indices/active_indices_updater.hpp"
 #include "storage/v2/indices/indices_utils.hpp"
+#include "storage/v2/inmemory/all_indices_cleanup.hpp"
 #include "storage/v2/inmemory/storage.hpp"
 #include "storage/v2/interesting_ids.hpp"
 #include "storage/v2/property_value.hpp"
 #include "utils/counter.hpp"
-
-namespace r = ranges;  // NOLINT(misc-unused-alias-decls)
 
 namespace memgraph::storage {
 
@@ -79,7 +78,8 @@ inline void TryInsertVertexPropertyIndex(Vertex &vertex, PropertyId property, au
 void AdvanceUntilValid_(auto &index_iterator, auto end, Vertex *&current_vertex, VertexAccessor &current_accessor,
                         Storage *storage, Transaction *transaction, View view, PropertyId property,
                         std::optional<utils::Bound<PropertyValue>> const &lower_bound,
-                        std::optional<utils::Bound<PropertyValue>> const &upper_bound, Gid max_gid) {
+                        std::optional<utils::Bound<PropertyValue>> const &upper_bound, Gid max_gid,
+                        PropertyValueRange::ValuePredicateFn const *value_predicate) {
   for (; index_iterator != end; ++index_iterator) {
     if (index_iterator->vertex == current_vertex) {
       continue;
@@ -92,6 +92,10 @@ void AdvanceUntilValid_(auto &index_iterator, auto end, Vertex *&current_vertex,
     if (!IsValueIncludedByUpperBound(index_iterator->value, upper_bound)) {
       index_iterator = end;
       break;
+    }
+
+    if (value_predicate && !(*value_predicate)(index_iterator->value)) {
+      continue;
     }
 
     if (index_iterator->vertex->gid >= max_gid) {
@@ -298,37 +302,37 @@ uint64_t InMemoryVertexPropertyIndex::RemoveObsoleteEntries(Storage *storage, ui
 
   auto const preserve_recent_entries = SweepPreservesRecentEntries(storage->GetStorageMode());
 
-  uint64_t swept = 0;
-  for (auto const &[property_id, index] : *cpy) {
-    if (token.stop_requested()) return swept;
-    // A sweep walks the whole index whether or not it has anything to collect.
-    if (!arming.arms_vertex_property_index_on(property_id)) continue;
-    ++swept;
+  return SweepArmedIndexes(
+      arming,
+      token,
+      *cpy,
+      [](auto const &entry) { return VertexPropertyKey{.property = entry.first}; },
+      [&](auto const &entry) {
+        auto const &[property_id, index] = entry;
+        auto acc = index->skip_list_.access();
+        for (auto it = acc.begin(); it != acc.end();) {
+          if (maybe_stop() && token.stop_requested()) return SweepOutcome::STOPPED;
 
-    auto acc = index->skip_list_.access();
-    for (auto it = acc.begin(); it != acc.end();) {
-      if (maybe_stop() && token.stop_requested()) return swept;
+          auto next_it = it;
+          ++next_it;
 
-      auto next_it = it;
-      ++next_it;
+          if (preserve_recent_entries && it->timestamp >= oldest_active_start_timestamp) {
+            it = next_it;
+            continue;
+          }
 
-      if (preserve_recent_entries && it->timestamp >= oldest_active_start_timestamp) {
-        it = next_it;
-        continue;
-      }
+          bool const has_next = next_it != acc.end();
 
-      bool const has_next = next_it != acc.end();
+          bool const redundant_duplicate = has_next && it->value == next_it->value && it->vertex == next_it->vertex;
+          if (redundant_duplicate ||
+              !AnyVersionHasProperty(*it->vertex, property_id, it->value, oldest_active_start_timestamp)) {
+            acc.remove(*it);
+          }
 
-      bool const redundant_duplicate = has_next && it->value == next_it->value && it->vertex == next_it->vertex;
-      if (redundant_duplicate ||
-          !AnyVersionHasProperty(*it->vertex, property_id, it->value, oldest_active_start_timestamp)) {
-        acc.remove(*it);
-      }
-
-      it = next_it;
-    }
-  }
-  return swept;
+          it = next_it;
+        }
+        return SweepOutcome::COMPLETED;
+      });
 }
 
 void InMemoryVertexPropertyIndex::DropGraphClearIndices() {
@@ -349,16 +353,17 @@ void InMemoryVertexPropertyIndex::RunGC() {
 
 InMemoryVertexPropertyIndex::Iterable::Iterable(
     utils::SkipListDb<InMemoryVertexPropertyIndex::Entry>::Accessor index_accessor,
-    utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor, PropertyId property,
-    std::optional<utils::Bound<PropertyValue>> const &lower_bound,
-    std::optional<utils::Bound<PropertyValue>> const &upper_bound, View view, Storage *storage,
-    Transaction *transaction, Gid max_gid)
+    utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor, PropertyId property, PropertyValueRange const &range,
+    View view, Storage *storage, Transaction *transaction, Gid max_gid)
     : pin_accessor_(std::move(vertex_accessor)),
       index_accessor_(std::move(index_accessor)),
       property_(property),
-      lower_bound_(lower_bound),
-      upper_bound_(upper_bound),
-      bounds_valid_(ValidateBounds(lower_bound_, upper_bound_, /*allow_whole_type_span=*/true)),
+      lower_bound_(range.lower_),
+      upper_bound_(range.upper_),
+      value_predicate_(range.GetValuePredicate()),
+      // An empty range has no bounds; reading only those would scan the whole index.
+      bounds_valid_(range.type_ != PropertyRangeType::INVALID &&
+                    ValidateBounds(lower_bound_, upper_bound_, /*allow_whole_type_span=*/true)),
       view_(view),
       storage_(storage),
       transaction_(transaction),
@@ -387,7 +392,8 @@ void InMemoryVertexPropertyIndex::Iterable::Iterator::AdvanceUntilValid() {
                      self_->property_,
                      self_->lower_bound_,
                      self_->upper_bound_,
-                     self_->max_gid_);
+                     self_->max_gid_,
+                     self_->value_predicate_.get());
 }
 
 InMemoryVertexPropertyIndex::Iterable InMemoryVertexPropertyIndex::ActiveIndices::Vertices(
@@ -395,14 +401,24 @@ InMemoryVertexPropertyIndex::Iterable InMemoryVertexPropertyIndex::ActiveIndices
     std::optional<utils::Bound<PropertyValue>> const &lower_bound,
     std::optional<utils::Bound<PropertyValue>> const &upper_bound, View view, Storage *storage,
     Transaction *transaction) {
+  return Vertices(property,
+                  std::move(vertex_accessor),
+                  PropertyValueRange::Bounded(lower_bound, upper_bound),
+                  view,
+                  storage,
+                  transaction);
+}
+
+InMemoryVertexPropertyIndex::Iterable InMemoryVertexPropertyIndex::ActiveIndices::Vertices(
+    PropertyId property, utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor, PropertyValueRange const &range,
+    View view, Storage *storage, Transaction *transaction) {
   auto it = index_container_->indices_.find(property);
   MG_ASSERT(it != index_container_->indices_.end(), "Index for vertex property {} doesn't exist", property.AsUint());
   auto const max_gid = Gid::FromUint(storage->vertex_id_.load(std::memory_order_acquire));
   return {it->second->skip_list_.access(),
           std::move(vertex_accessor),
           property,
-          lower_bound,
-          upper_bound,
+          range,
           view,
           storage,
           transaction,
@@ -414,14 +430,25 @@ InMemoryVertexPropertyIndex::ChunkedIterable InMemoryVertexPropertyIndex::Active
     std::optional<utils::Bound<PropertyValue>> const &lower_bound,
     std::optional<utils::Bound<PropertyValue>> const &upper_bound, View view, Storage *storage,
     Transaction *transaction, size_t num_chunks) {
+  return ChunkedVertices(property,
+                         std::move(vertex_accessor),
+                         PropertyValueRange::Bounded(lower_bound, upper_bound),
+                         view,
+                         storage,
+                         transaction,
+                         num_chunks);
+}
+
+InMemoryVertexPropertyIndex::ChunkedIterable InMemoryVertexPropertyIndex::ActiveIndices::ChunkedVertices(
+    PropertyId property, utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor, PropertyValueRange const &range,
+    View view, Storage *storage, Transaction *transaction, size_t num_chunks) {
   auto it = index_container_->indices_.find(property);
   MG_ASSERT(it != index_container_->indices_.end(), "Index for vertex property {} doesn't exist", property.AsUint());
   auto const max_gid = Gid::FromUint(storage->vertex_id_.load(std::memory_order_acquire));
   return {it->second->skip_list_.access(),
           std::move(vertex_accessor),
           property,
-          lower_bound,
-          upper_bound,
+          range,
           view,
           storage,
           transaction,
@@ -466,26 +493,21 @@ auto InMemoryVertexPropertyIndex::GetIndividualIndex(PropertyId property) const 
 }
 
 void InMemoryVertexPropertyIndex::CleanupAllIndices() {
-  all_indices_.WithLock([](std::shared_ptr<std::vector<AllIndicesEntry> const> &indices) {
-    auto keep_condition = [](AllIndicesEntry const &entry) { return entry.second.use_count() != 1; };
-    if (!r::all_of(*indices, keep_condition)) {
-      indices = std::make_shared<std::vector<AllIndicesEntry>>(*indices | rv::filter(keep_condition) | r::to_vector);
-    }
-  });
+  storage::CleanupAllIndices(all_indices_, [](AllIndicesEntry const &e) { return e.second.use_count(); });
 }
 
 InMemoryVertexPropertyIndex::ChunkedIterable::ChunkedIterable(
     utils::SkipListDb<InMemoryVertexPropertyIndex::Entry>::Accessor index_accessor,
-    utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor, PropertyId property,
-    std::optional<utils::Bound<PropertyValue>> const &lower_bound,
-    std::optional<utils::Bound<PropertyValue>> const &upper_bound, View view, Storage *storage,
-    Transaction *transaction, size_t num_chunks, Gid max_gid)
+    utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor, PropertyId property, PropertyValueRange const &range,
+    View view, Storage *storage, Transaction *transaction, size_t num_chunks, Gid max_gid)
     : pin_accessor_(std::move(vertex_accessor)),
       index_accessor_(std::move(index_accessor)),
       property_(property),
-      lower_bound_(lower_bound),
-      upper_bound_(upper_bound),
-      bounds_valid_(ValidateBounds(lower_bound_, upper_bound_, /*allow_whole_type_span=*/true)),
+      lower_bound_(range.lower_),
+      upper_bound_(range.upper_),
+      value_predicate_(range.GetValuePredicate()),
+      bounds_valid_(range.type_ != PropertyRangeType::INVALID &&
+                    ValidateBounds(lower_bound_, upper_bound_, /*allow_whole_type_span=*/true)),
       view_(view),
       storage_(storage),
       transaction_(transaction),
@@ -511,7 +533,8 @@ void InMemoryVertexPropertyIndex::ChunkedIterable::Iterator::AdvanceUntilValid()
                      self_->property_,
                      self_->lower_bound_,
                      self_->upper_bound_,
-                     self_->max_gid_);
+                     self_->max_gid_,
+                     self_->value_predicate_.get());
 }
 
 }  // namespace memgraph::storage

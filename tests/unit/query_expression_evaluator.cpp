@@ -26,6 +26,7 @@
 #include "query/db_accessor.hpp"
 #include "query/frontend/ast/ast.hpp"
 #include "query/frontend/opencypher/parser.hpp"
+#include "query/graph.hpp"
 #include "query/interpret/awesome_memgraph_functions.hpp"
 #include "query/interpret/eval.hpp"
 #include "query/interpret/frame.hpp"
@@ -33,6 +34,7 @@
 #include "query/string_helpers.hpp"
 #include "query/typed_value.hpp"
 #include "query/virtual_edge.hpp"
+#include "query/virtual_graph.hpp"
 #include "query/virtual_node.hpp"
 #include "storage/v2/disk/storage.hpp"
 #include "storage/v2/enum.hpp"
@@ -40,6 +42,7 @@
 #include "storage/v2/storage.hpp"
 #include "tests/unit/timezone_handler.hpp"
 #include "utils/exceptions.hpp"
+#include "utils/memory.hpp"
 #include "utils/string.hpp"
 
 #include "query_common.hpp"
@@ -469,6 +472,240 @@ TYPED_TEST(ExpressionEvaluatorTest, GreaterOperatorIncompatibleOperands) {
     auto val7 = op->Accept(this->eval);
     EXPECT_TRUE(val7.IsNull());
   }
+}
+
+TYPED_TEST(ExpressionEvaluatorTest, InListOperatorOverContainersHoldingNull) {
+  // A membership test asks equality of each element, so it inherits equality's
+  // answer: undecided against anything holding a Null that it does not
+  // otherwise differ from. The set the operator caches the list in answers by
+  // equivalence, which cannot say that, so these read the list element by
+  // element instead.
+  auto const list_of = [this](std::vector<Expression *> elements) {
+    return this->storage.template Create<ListLiteral>(std::move(elements));
+  };
+  auto const null_literal = [this] {
+    return this->storage.template Create<PrimitiveLiteral>(memgraph::storage::ExternalPropertyValue());
+  };
+  auto const in = [this](Expression *probe, Expression *list) {
+    return this->storage.template Create<InListOperator>(probe, list);
+  };
+
+  {
+    // The probe and the only element are the same shape and hold a Null.
+    auto value = this->Eval(in(list_of({null_literal()}), list_of({list_of({null_literal()})})));
+    EXPECT_TRUE(value.IsNull());
+  }
+  auto *probe_without_a_null =
+      in(list_of({this->storage.template Create<PrimitiveLiteral>(1)}),
+         list_of({list_of({null_literal()}), list_of({this->storage.template Create<PrimitiveLiteral>(2)})}));
+  {
+    // The probe holds no Null, but an element it does not otherwise differ from
+    // does.
+    EXPECT_TRUE(this->Eval(probe_without_a_null).IsNull());
+  }
+  // The operator caches the list only when the query tracks the key, which the
+  // evaluator above does not do. These read the same expressions through an
+  // evaluator that does, so the answer cannot depend on whether the list was
+  // cached.
+  auto const eval_with_the_list_cached = [this](InListOperator *op) {
+    FrameChangeCollector collector;
+    collector.AddInListKey(memgraph::utils::GetFrameChangeId(*op));
+    ExpressionEvaluator caching{&this->frame, this->execution_context, memgraph::storage::View::OLD, &collector};
+    return op->Accept(caching);
+  };
+
+  {
+    // The same, with the list cached. A lookup would report the probe absent,
+    // because no element is equivalent to it.
+    EXPECT_TRUE(eval_with_the_list_cached(probe_without_a_null).IsNull());
+  }
+  {
+    // The list holds no Null, so it is cached, and the probe holds one. A
+    // lookup reports the probe absent where equality cannot decide it.
+    auto *op = in(list_of({null_literal()}),
+                  list_of({list_of({this->storage.template Create<PrimitiveLiteral>(1)}),
+                           list_of({this->storage.template Create<PrimitiveLiteral>(2)})}));
+    EXPECT_TRUE(this->Eval(op).IsNull());
+    EXPECT_TRUE(eval_with_the_list_cached(op).IsNull());
+  }
+  {
+    // The same, but no element is even the same length, so the Null decides
+    // nothing and the answer is settled.
+    auto *op = in(list_of({null_literal()}),
+                  list_of({list_of({this->storage.template Create<PrimitiveLiteral>(1),
+                                    this->storage.template Create<PrimitiveLiteral>(2)})}));
+    EXPECT_EQ(this->Eval(op).ValueBool(), false);
+    EXPECT_EQ(eval_with_the_list_cached(op).ValueBool(), false);
+  }
+  {
+    // An element holding a Null below its top level costs the set its exactness, so the list is
+    // read element by element however the key is tracked.
+    auto *op = in(list_of({null_literal()}), list_of({list_of({null_literal()})}));
+    EXPECT_TRUE(this->Eval(op).IsNull());
+    EXPECT_TRUE(eval_with_the_list_cached(op).IsNull());
+  }
+  {
+    // Nothing holds a Null, so the answer is decided and the set may be read.
+    auto value = this->Eval(in(list_of({this->storage.template Create<PrimitiveLiteral>(1)}),
+                               list_of({list_of({this->storage.template Create<PrimitiveLiteral>(1)}),
+                                        list_of({this->storage.template Create<PrimitiveLiteral>(2)})})));
+    EXPECT_EQ(value.ValueBool(), true);
+  }
+  {
+    auto value = this->Eval(in(list_of({this->storage.template Create<PrimitiveLiteral>(3)}),
+                               list_of({list_of({this->storage.template Create<PrimitiveLiteral>(1)}),
+                                        list_of({this->storage.template Create<PrimitiveLiteral>(2)})})));
+    EXPECT_EQ(value.ValueBool(), false);
+  }
+
+  // Every row after the first reads a set that is already populated, which is a different path
+  // through the operator than the row that fills it. These take both.
+  auto const eval_twice_through_one_collector = [this](InListOperator *op) {
+    FrameChangeCollector collector;
+    collector.AddInListKey(memgraph::utils::GetFrameChangeId(*op));
+    ExpressionEvaluator caching{&this->frame, this->execution_context, memgraph::storage::View::OLD, &collector};
+    auto const filling_the_set = op->Accept(caching);
+    auto const reading_it = op->Accept(caching);
+    EXPECT_EQ(filling_the_set.type(), reading_it.type());
+    return reading_it;
+  };
+  auto const literal = [this](int value) { return this->storage.template Create<PrimitiveLiteral>(value); };
+
+  {
+    // A top-level Null element keeps the set exact: the explicit lookup for a Null answers it, so
+    // the sought value the list does hold is still found by one lookup.
+    auto *op = in(literal(1), list_of({literal(1), null_literal()}));
+    EXPECT_EQ(this->Eval(op).ValueBool(), true);
+    EXPECT_EQ(eval_twice_through_one_collector(op).ValueBool(), true);
+  }
+  {
+    // And one the list does not hold is left undecided by that Null rather than answered absent.
+    auto *op = in(literal(3), list_of({literal(1), null_literal()}));
+    EXPECT_TRUE(this->Eval(op).IsNull());
+    EXPECT_TRUE(eval_twice_through_one_collector(op).IsNull());
+  }
+  {
+    // With no Null anywhere the set decides both answers on its own.
+    auto *present = in(literal(2), list_of({literal(1), literal(2)}));
+    EXPECT_EQ(eval_twice_through_one_collector(present).ValueBool(), true);
+    auto *absent = in(literal(3), list_of({literal(1), literal(2)}));
+    EXPECT_EQ(eval_twice_through_one_collector(absent).ValueBool(), false);
+  }
+}
+
+TYPED_TEST(ExpressionEvaluatorTest, InListOperatorOverValuesHoldingANaN) {
+  // A membership test asks equality of each element, and a NaN is equal to
+  // nothing, itself included, so a list holding one holds nothing a NaN is a
+  // member of. The set the operator caches the list in answers by equivalence,
+  // which holds two NaNs alike so that a hash container can find an entry
+  // again, so a lookup there reports a member the equality has none of.
+  auto const nan = [this] {
+    return this->storage.template Create<PrimitiveLiteral>(std::numeric_limits<double>::quiet_NaN());
+  };
+  auto const number = [this](double value) { return this->storage.template Create<PrimitiveLiteral>(value); };
+  auto const list_of = [this](std::vector<Expression *> elements) {
+    return this->storage.template Create<ListLiteral>(std::move(elements));
+  };
+  auto const in = [this](Expression *probe, Expression *list) {
+    return this->storage.template Create<InListOperator>(probe, list);
+  };
+  // Filling the set and reading an already-filled one are different paths
+  // through the operator, and every row after the first takes the second.
+  auto const eval_twice_through_one_collector = [this](InListOperator *op) {
+    FrameChangeCollector collector;
+    collector.AddInListKey(memgraph::utils::GetFrameChangeId(*op));
+    ExpressionEvaluator caching{&this->frame, this->execution_context, memgraph::storage::View::OLD, &collector};
+    auto const filling_the_set = op->Accept(caching);
+    auto const reading_it = op->Accept(caching);
+    EXPECT_EQ(filling_the_set.type(), reading_it.type());
+    return reading_it;
+  };
+
+  {
+    // The sought value and the only element are both NaNs.
+    auto *op = in(nan(), list_of({nan()}));
+    EXPECT_EQ(this->Eval(op).ValueBool(), false);
+    EXPECT_EQ(eval_twice_through_one_collector(op).ValueBool(), false);
+  }
+  {
+    // A number beside the NaN still answers for itself, so the whole list is
+    // not simply being refused.
+    auto *sought_nan = in(nan(), list_of({number(1.0), nan()}));
+    EXPECT_EQ(this->Eval(sought_nan).ValueBool(), false);
+    EXPECT_EQ(eval_twice_through_one_collector(sought_nan).ValueBool(), false);
+
+    auto *sought_number = in(number(1.0), list_of({number(1.0), nan()}));
+    EXPECT_EQ(this->Eval(sought_number).ValueBool(), true);
+    EXPECT_EQ(eval_twice_through_one_collector(sought_number).ValueBool(), true);
+
+    auto *absent_number = in(number(2.0), list_of({number(1.0), nan()}));
+    EXPECT_EQ(this->Eval(absent_number).ValueBool(), false);
+    EXPECT_EQ(eval_twice_through_one_collector(absent_number).ValueBool(), false);
+  }
+  {
+    // A list holding no NaN keeps the set exact, and a NaN sought in one is
+    // absent rather than undecided, so the lookup answers it without the loop.
+    auto *op = in(nan(), list_of({number(1.0), number(2.0)}));
+    EXPECT_EQ(this->Eval(op).ValueBool(), false);
+    EXPECT_EQ(eval_twice_through_one_collector(op).ValueBool(), false);
+  }
+  {
+    // A NaN below the top level of an element is no more a member than one at
+    // it, and the walk has to reach it.
+    auto *op = in(list_of({nan()}), list_of({list_of({nan()})}));
+    EXPECT_EQ(this->Eval(op).ValueBool(), false);
+    EXPECT_EQ(eval_twice_through_one_collector(op).ValueBool(), false);
+  }
+  {
+    // A point carries its coordinates as doubles, so one holding a NaN is a
+    // member of nothing either.
+    auto const nan_point = [this] {
+      return this->storage.template Create<PrimitiveLiteral>(
+          memgraph::storage::ExternalPropertyValue(memgraph::storage::Point2d{
+              memgraph::storage::CoordinateReferenceSystem::WGS84_2d, std::numeric_limits<double>::quiet_NaN(), 1.0}));
+    };
+    auto *op = in(nan_point(), list_of({nan_point()}));
+    EXPECT_EQ(this->Eval(op).ValueBool(), false);
+    EXPECT_EQ(eval_twice_through_one_collector(op).ValueBool(), false);
+  }
+}
+
+TYPED_TEST(ExpressionEvaluatorTest, InListOperatorWhereTheSoughtValueIsNullOnALaterRow) {
+  // A filter reads one membership test over every row, so a row whose sought
+  // value is Null arrives after rows that filled the set. That row takes the
+  // path that reads the set rather than the one that fills it, and a lookup
+  // there can only report present or absent. Membership of a Null in a list
+  // holding anything is undecided, and `NOT` of it stays undecided, so a row no
+  // filter can judge is kept by neither.
+  auto *sought = this->storage.template Create<Identifier>("v", true);
+  auto const sought_symbol = this->symbol_table.CreateSymbol("v", true);
+  sought->MapTo(sought_symbol);
+  auto const bind = [this, sought_symbol](TypedValue value) {
+    auto frame_writer = FrameWriter(this->frame, nullptr, this->ctx.memory);
+    frame_writer.Write(sought_symbol, value);
+  };
+
+  auto *op = this->storage.template Create<InListOperator>(
+      sought,
+      this->storage.template Create<ListLiteral>(
+          std::vector<Expression *>{this->storage.template Create<PrimitiveLiteral>(10)}));
+  auto *negated = this->storage.template Create<NotOperator>(op);
+
+  FrameChangeCollector collector;
+  collector.AddInListKey(memgraph::utils::GetFrameChangeId(*op));
+  ExpressionEvaluator caching{&this->frame, this->execution_context, memgraph::storage::View::OLD, &collector};
+
+  bind(TypedValue(10));
+  EXPECT_EQ(op->Accept(caching).ValueBool(), true);
+  EXPECT_EQ(negated->Accept(caching).ValueBool(), false);
+
+  bind(TypedValue());
+  EXPECT_TRUE(op->Accept(caching).IsNull());
+  EXPECT_TRUE(negated->Accept(caching).IsNull());
+
+  bind(TypedValue(11));
+  EXPECT_EQ(op->Accept(caching).ValueBool(), false);
+  EXPECT_EQ(negated->Accept(caching).ValueBool(), true);
 }
 
 TYPED_TEST(ExpressionEvaluatorTest, InListOperator) {
@@ -987,6 +1224,70 @@ TYPED_TEST(ExpressionEvaluatorTest, LabelsTest) {
     auto value = this->Eval(op);
     EXPECT_TRUE(value.IsNull());
   }
+}
+
+// `%` asks whether the node carries any label at all, and says nothing about which.
+TYPED_TEST(ExpressionEvaluatorTest, LabelsTestWildcard) {
+  auto labelled = this->dba.InsertVertex();
+  ASSERT_TRUE(labelled.AddLabel(this->dba.NameToLabel("ANIMAL")).has_value());
+  auto bare = this->dba.InsertVertex();
+  this->dba.AdvanceCommand();
+
+  auto *identifier = this->storage.template Create<Identifier>("n");
+  auto node_symbol = this->symbol_table.CreateSymbol("n", true);
+  identifier->MapTo(node_symbol);
+
+  auto eval_on = [&](const TypedValue &value) {
+    auto frame_writer = FrameWriter(this->frame, nullptr, this->ctx.memory);
+    frame_writer.Write(node_symbol, value);
+    return this->Eval(LabelsTest::Make(this->storage, identifier, LabelTerm{LabelTerm::Wildcard{}}));
+  };
+  EXPECT_TRUE(eval_on(TypedValue(labelled)).ValueBool());
+  EXPECT_FALSE(eval_on(TypedValue(bare)).ValueBool());
+
+  // A vertex of this command does not exist under the OLD view the evaluator reads, so `%` reads it under NEW.
+  auto fresh = this->dba.InsertVertex();
+  ASSERT_TRUE(fresh.AddLabel(this->dba.NameToLabel("ANIMAL")).has_value());
+  EXPECT_TRUE(eval_on(TypedValue(fresh)).ValueBool());
+}
+
+// A term held whole is evaluated against the one vertex its subject gives.
+TYPED_TEST(ExpressionEvaluatorTest, LabelsTestWholeTerm) {
+  auto animal_ix = this->storage.GetLabelIx("ANIMAL");
+  auto plant_ix = this->storage.GetLabelIx("PLANT");
+  auto animal = this->dba.InsertVertex();
+  ASSERT_TRUE(animal.AddLabel(this->dba.NameToLabel("ANIMAL")).has_value());
+  auto plant = this->dba.InsertVertex();
+  ASSERT_TRUE(plant.AddLabel(this->dba.NameToLabel("PLANT")).has_value());
+  auto both = this->dba.InsertVertex();
+  ASSERT_TRUE(both.AddLabel(this->dba.NameToLabel("ANIMAL")).has_value());
+  ASSERT_TRUE(both.AddLabel(this->dba.NameToLabel("PLANT")).has_value());
+  auto bare = this->dba.InsertVertex();
+  this->dba.AdvanceCommand();
+
+  auto *identifier = this->storage.template Create<Identifier>("n");
+  auto node_symbol = this->symbol_table.CreateSymbol("n", true);
+  identifier->MapTo(node_symbol);
+
+  auto leaf = [](LabelIx label) { return LabelTerm{LabelTerm::Label{label}}; };
+  auto test_of = [&](LabelTerm term) { return LabelsTest::Make(this->storage, identifier, std::move(term)); };
+  // (ANIMAL|PLANT)&!(ANIMAL&PLANT): each of `|`, `&` and `!` read as another operator changes a row below.
+  auto term = LabelTerm{
+      LabelTerm::And{{LabelTerm{LabelTerm::Or{{leaf(animal_ix), leaf(plant_ix)}}},
+                      LabelTerm{LabelTerm::Not{LabelTerm{LabelTerm::And{{leaf(animal_ix), leaf(plant_ix)}}}}}}}};
+  // An empty `$p` under an operator: an `And` of nothing.
+  auto empty_conjunction = LabelTerm{LabelTerm::And{}};
+
+  auto eval_on = [&](const TypedValue &value, LabelsTest *op) {
+    auto frame_writer = FrameWriter(this->frame, nullptr, this->ctx.memory);
+    frame_writer.Write(node_symbol, value);
+    return this->Eval(op);
+  };
+  EXPECT_TRUE(eval_on(TypedValue(animal), test_of(term)).ValueBool());
+  EXPECT_TRUE(eval_on(TypedValue(plant), test_of(term)).ValueBool());
+  EXPECT_FALSE(eval_on(TypedValue(both), test_of(term)).ValueBool());
+  EXPECT_FALSE(eval_on(TypedValue(bare), test_of(term)).ValueBool());
+  EXPECT_TRUE(eval_on(TypedValue(bare), test_of(empty_conjunction)).ValueBool());
 }
 
 TYPED_TEST(ExpressionEvaluatorTest, EdgeTypesTest) {
@@ -2123,6 +2424,95 @@ TYPED_TEST(FunctionTest, Last) {
   ASSERT_THROW(this->EvaluateFunction("LAST", 5), QueryRuntimeException);
 }
 
+TYPED_TEST(FunctionTest, NullIf) {
+  ASSERT_THROW(this->EvaluateFunction("NULLIF"), QueryRuntimeException);
+  ASSERT_THROW(this->EvaluateFunction("NULLIF", 1), QueryRuntimeException);
+  ASSERT_THROW(this->EvaluateFunction("NULLIF", 1, 2, 3), QueryRuntimeException);
+
+  // Equal arguments are taken away, unequal ones leave the first standing.
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", 1, 1).IsNull());
+  ASSERT_EQ(this->EvaluateFunction("NULLIF", 1, 2).ValueInt(), 1);
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", "abc", "abc").IsNull());
+  ASSERT_EQ(this->EvaluateFunction("NULLIF", "abc", "def").ValueString(), "abc");
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", true, true).IsNull());
+  ASSERT_FALSE(this->EvaluateFunction("NULLIF", false, true).ValueBool());
+
+  // An integer and a float of the same value are equal, so either order is taken away.
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", 1, 1.0).IsNull());
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", 1.0, 1).IsNull());
+
+  // Two different types are unequal rather than an error.
+  ASSERT_EQ(this->EvaluateFunction("NULLIF", 1, "1").ValueInt(), 1);
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", true, 1).ValueBool());
+
+  // A Null decides nothing, so the first argument stands whatever it is.
+  ASSERT_EQ(this->EvaluateFunction("NULLIF", 1, TypedValue()).ValueInt(), 1);
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", TypedValue(), 1).IsNull());
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", TypedValue(), TypedValue()).IsNull());
+
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", MakeTypedValueList(1, 2), MakeTypedValueList(1, 2)).IsNull());
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", MakeTypedValueList(), MakeTypedValueList()).IsNull());
+  CompareList(this->EvaluateFunction("NULLIF", MakeTypedValueList(1, 2), MakeTypedValueList(1, 3)),
+              MakeTypedValueList(1, 2));
+  // A list is not equal to the scalar it holds, so the scalar stands.
+  ASSERT_EQ(this->EvaluateFunction("NULLIF", 2, MakeTypedValueList(2)).ValueInt(), 2);
+
+  // nullIf reads equality, and not equivalence. The two relations answer differently for exactly one
+  // shape -- a container holding a Null -- so it is the only thing that can pin which one is read.
+  // Equivalence, the relation DISTINCT and grouping are keyed by, holds this pair the same value:
+  auto null_element = MakeTypedValueList(TypedValue());
+  ASSERT_TRUE(TypedValue::BoolEqual{}(null_element, MakeTypedValueList(TypedValue())));
+  // Equality leaves it undecided instead, and that is the answer nullIf follows, so the list stands.
+  // Reading equivalence here would answer Null. See TypedValue.EqualityOfAContainerHoldingNullIsUndecided.
+  CompareList(this->EvaluateFunction("NULLIF", null_element, MakeTypedValueList(TypedValue())), null_element);
+  auto trailing_null = MakeTypedValueList(1, TypedValue());
+  CompareList(this->EvaluateFunction("NULLIF", trailing_null, MakeTypedValueList(1, TypedValue())), trailing_null);
+  CompareList(this->EvaluateFunction("NULLIF", MakeTypedValueList(1), MakeTypedValueList(TypedValue())),
+              MakeTypedValueList(1));
+  // A pair decided unequal settles the comparison, and unequal leaves the list standing all the same.
+  CompareList(
+      this->EvaluateFunction("NULLIF", MakeTypedValueList(1, TypedValue()), MakeTypedValueList(2, TypedValue())),
+      MakeTypedValueList(1, TypedValue()));
+
+  // A map holding a Null is the same story.
+  auto null_valued = TypedValue(std::map<std::string, TypedValue>{{"a", TypedValue()}});
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", null_valued, null_valued).IsMap());
+  auto one_valued = TypedValue(std::map<std::string, TypedValue>{{"a", TypedValue(1)}});
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", one_valued, one_valued).IsNull());
+
+  // A NaN is not equal to itself, so it is never taken away.
+  auto const nan = std::numeric_limits<double>::quiet_NaN();
+  ASSERT_TRUE(std::isnan(this->EvaluateFunction("NULLIF", nan, nan).ValueDouble()));
+
+  // Durations follow the same equality the `=` operator reads.
+  const memgraph::utils::Duration one_day({1, 0, 0, 0, 0, 0});
+  const memgraph::utils::Duration one_hour({0, 1, 0, 0, 0, 0});
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", TypedValue(one_day), TypedValue(one_day)).IsNull());
+  ASSERT_EQ(this->EvaluateFunction("NULLIF", TypedValue(one_day), TypedValue(one_hour)).ValueDuration(), one_day);
+
+  // Nodes compare by identity, so two nodes carrying the same property are still unequal.
+  auto first = this->dba.InsertVertex();
+  auto second = this->dba.InsertVertex();
+  auto const prop = this->dba.NameToProperty("p");
+  ASSERT_TRUE(first.SetProperty(prop, memgraph::storage::PropertyValue(1)).has_value());
+  ASSERT_TRUE(second.SetProperty(prop, memgraph::storage::PropertyValue(1)).has_value());
+  this->dba.AdvanceCommand();
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", TypedValue(first), TypedValue(first)).IsNull());
+  ASSERT_EQ(this->EvaluateFunction("NULLIF", TypedValue(first), TypedValue(second)).ValueVertex(), first);
+
+  // A pair no equality is defined over is an error here exactly as it is for `=`, which means the
+  // same class of error: a query error the client is told is its own, and not one the driver may
+  // replay. A graph against some other type never reaches that comparison, since differing types
+  // are unequal first.
+  auto graph = TypedValue(memgraph::query::Graph(memgraph::utils::NewDeleteResource()));
+  auto other_graph = TypedValue(memgraph::query::Graph(memgraph::utils::NewDeleteResource()));
+  auto const graph_pair = this->ExpressionsFromTypedValues({graph, other_graph});
+  ASSERT_THROW(this->Eval(this->storage.template Create<EqualOperator>(graph_pair[0], graph_pair[1])),
+               QueryRuntimeException);
+  ASSERT_THROW(this->EvaluateFunction("NULLIF", graph, other_graph), QueryRuntimeException);
+  ASSERT_TRUE(this->EvaluateFunction("NULLIF", graph, 1).IsGraph());
+}
+
 TYPED_TEST(FunctionTest, Size) {
   ASSERT_THROW(this->EvaluateFunction("SIZE"), QueryRuntimeException);
   ASSERT_TRUE(this->EvaluateFunction("SIZE", TypedValue()).IsNull());
@@ -2549,6 +2939,14 @@ TYPED_TEST(FunctionTest, ValueType) {
   ASSERT_EQ(this->EvaluateFunction("VALUETYPE", TypedValue(Enum{EnumTypeId{0}, EnumValueId{0}})).ValueString(), "ENUM");
   ASSERT_EQ(this->EvaluateFunction("VALUETYPE", TypedValue(Point2d(Cartesian_2d, 1, 2))).ValueString(), "POINT");
   ASSERT_EQ(this->EvaluateFunction("VALUETYPE", TypedValue(Point3d(Cartesian_3d, 1, 2, 3))).ValueString(), "POINT");
+  auto vn1 = std::make_shared<const memgraph::query::VirtualNode>(memgraph::query::VirtualNode({"L1"}, {}));
+  auto vn2 = std::make_shared<const memgraph::query::VirtualNode>(memgraph::query::VirtualNode({"L2"}, {}));
+  ASSERT_EQ(this->EvaluateFunction("VALUETYPE", TypedValue(*vn1)).ValueString(), "VIRTUAL_NODE");
+  ASSERT_EQ(this->EvaluateFunction("VALUETYPE", TypedValue(memgraph::query::VirtualEdge(vn1, vn2, "ET"))).ValueString(),
+            "VIRTUAL_RELATIONSHIP");
+  ASSERT_EQ(
+      this->EvaluateFunction("VALUETYPE", TypedValue(VirtualGraph(memgraph::utils::NewDeleteResource()))).ValueString(),
+      "VIRTUAL_GRAPH");
 }
 
 TYPED_TEST(FunctionTest, Labels) {

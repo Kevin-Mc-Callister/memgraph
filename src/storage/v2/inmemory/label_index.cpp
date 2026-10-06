@@ -10,17 +10,17 @@
 // licenses/APL.txt.
 
 #include "storage/v2/inmemory/label_index.hpp"
-#include <range/v3/all.hpp>
+
+#include <algorithm>
+
 #include "storage/v2/interesting_ids.hpp"
 
 #include "metrics/prometheus_metrics.hpp"
 #include "storage/v2/indices/active_indices_updater.hpp"
 #include "storage/v2/indices/indices_utils.hpp"
+#include "storage/v2/inmemory/all_indices_cleanup.hpp"
 #include "storage/v2/inmemory/storage.hpp"
 #include "utils/counter.hpp"
-
-namespace r = ranges;
-namespace rv = r::views;
 
 namespace {
 void AdvanceUntilValid_(auto &index_iterator, const auto &end, auto *&current_vertex,
@@ -267,36 +267,35 @@ uint64_t InMemoryLabelIndex::RemoveObsoleteEntries(Storage *storage, uint64_t ol
 
   auto const preserve_recent_entries = SweepPreservesRecentEntries(storage->GetStorageMode());
 
-  uint64_t swept = 0;
-  for (auto &[index, label] : *index_container) {
-    // before starting index, check if stop_requested
-    if (token.stop_requested()) return swept;
-    // A sweep walks the whole index whether or not it has anything to collect.
-    if (!arming.arms_vertex_index_on(label)) continue;
-    ++swept;
+  return SweepArmedIndexes(
+      arming,
+      token,
+      *index_container,
+      [](auto const &entry) { return LabelKey{.label = entry.label_}; },
+      [&](auto const &entry) {
+        auto const &label = entry.label_;
+        auto vertices_acc = entry.index_->skiplist.access();
+        for (auto it = vertices_acc.begin(); it != vertices_acc.end();) {
+          // Hot loop, don't check stop_requested every time
+          if (maybe_stop() && token.stop_requested()) return SweepOutcome::STOPPED;
 
-    auto vertices_acc = index->skiplist.access();
-    for (auto it = vertices_acc.begin(); it != vertices_acc.end();) {
-      // Hot loop, don't check stop_requested every time
-      if (maybe_stop() && token.stop_requested()) return swept;
+          auto next_it = it;
+          ++next_it;
 
-      auto next_it = it;
-      ++next_it;
+          if (preserve_recent_entries && it->timestamp >= oldest_active_start_timestamp) {
+            it = next_it;
+            continue;
+          }
 
-      if (preserve_recent_entries && it->timestamp >= oldest_active_start_timestamp) {
-        it = next_it;
-        continue;
-      }
+          if ((next_it != vertices_acc.end() && it->vertex == next_it->vertex) ||
+              !AnyVersionHasLabel(*it->vertex, label, oldest_active_start_timestamp)) {
+            vertices_acc.remove(*it);
+          }
 
-      if ((next_it != vertices_acc.end() && it->vertex == next_it->vertex) ||
-          !AnyVersionHasLabel(*it->vertex, label, oldest_active_start_timestamp)) {
-        vertices_acc.remove(*it);
-      }
-
-      it = next_it;
-    }
-  }
-  return swept;
+          it = next_it;
+        }
+        return SweepOutcome::COMPLETED;
+      });
 }
 
 void InMemoryLabelIndex::ActiveIndices::AbortEntries(LabelIndex::AbortableInfo const &info,
@@ -453,14 +452,7 @@ void InMemoryLabelIndex::DropGraphClearIndices() {
 }
 
 void InMemoryLabelIndex::CleanupAllIndices() {
-  // By cleanup, we mean just cleanup of the all_indexes_
-  // If all_indexes_ is the only thing holding onto an IndividualIndex, we remove it
-  all_indices_.WithLock([](std::shared_ptr<std::vector<AllIndicesEntry> const> &indices) {
-    auto keep_condition = [](AllIndicesEntry const &entry) { return entry.index_.use_count() != 1; };
-    if (!ranges::all_of(*indices, keep_condition)) {
-      indices = std::make_shared<std::vector<AllIndicesEntry>>(*indices | rv::filter(keep_condition) | r::to_vector);
-    }
-  });
+  storage::CleanupAllIndices(all_indices_, [](AllIndicesEntry const &e) { return e.index_.use_count(); });
 }
 
 void InMemoryLabelIndex::ChunkedIterable::Iterator::AdvanceUntilValid() {

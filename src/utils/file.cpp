@@ -116,7 +116,18 @@ bool RenamePath(const std::filesystem::path &src, const std::filesystem::path &d
 bool HasReadAccess(const std::filesystem::path &path) { return access(path.c_str(), R_OK) == 0; }
 
 // `len == 0` means "to the end of the file".
-void DropCachedPages(int fd) { ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); }
+int DropCachedPages(int fd) { return ::posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); }
+
+namespace {
+// A refusal cannot be repaired and must not fail the operation it belongs to: the caller asked for
+// memory back, not for an outcome. It is still worth saying, because a release the kernel declines
+// frees nothing and leaves no other sign that it did not.
+void WarnIfPagesKept(int result, const std::filesystem::path &path) {
+  if (result == 0) return;
+  spdlog::warn(
+      "Releasing the page cache for {} was refused: {} ({}). Its pages stay cached.", path, strerror(result), result);
+}
+}  // namespace
 
 static_assert(std::is_same_v<off_t, ssize_t>, "off_t must fit into ssize_t!");
 
@@ -349,7 +360,7 @@ void InputFile::FoldPendingCrc() {
   crc_fold_position_ = consumed_up_to;
 }
 
-void InputFile::DropCachedPages() const { utils::DropCachedPages(fd_); }
+void InputFile::DropCachedPages() const { WarnIfPagesKept(utils::DropCachedPages(fd_), path_); }
 
 bool InputFile::LoadBuffer() {
   // The buffer is about to be discarded; fold its consumed bytes into the CRC first. When the buffer was fully
@@ -600,6 +611,8 @@ void OutputFile::Sync() {
   // Reset the counter.
   written_since_last_sync_ = 0;
 }
+
+void OutputFile::DropCachedPages() const { WarnIfPagesKept(utils::DropCachedPages(fd_), path_); }
 
 void OutputFile::Close() noexcept {
   FlushBuffer();
@@ -944,6 +957,7 @@ void NonConcurrentOutputFile::FlushBufferInternal(size_t to_write) {
 void NonConcurrentOutputFile::EnableWritebackPacing(size_t window_bytes, PageCachePolicy completed_window) {
   pacing_window_ = window_bytes;
   pacing_completed_window_ = completed_window;
+  pacing_windows_completed_ = 0;
   RestartPacing(0);
 }
 
@@ -955,7 +969,7 @@ void NonConcurrentOutputFile::RestartPacing(size_t offset) {
 }
 
 void NonConcurrentOutputFile::DropCachedPages() {
-  utils::DropCachedPages(fd_);
+  WarnIfPagesKept(utils::DropCachedPages(fd_), path_);
   // The windows in flight describe ranges that are no longer cached, so nothing is owed on them.
   RestartPacing(pacing_offset_);
 }
@@ -1029,6 +1043,7 @@ void NonConcurrentOutputFile::PaceWriteback(size_t bytes) {
   // exceeds the device's request queue. That is the trade pacing exists to make: this writer waits
   // instead of every writer on the machine waiting at `dirty_ratio`.
   if (!sync_range(pacing_pending_start_, pending_len, SYNC_FILE_RANGE_WRITE)) return;
+  ++pacing_windows_completed_;
 
   if (pacing_prev_len_ != 0) {
     if (!sync_range(pacing_prev_start_, pacing_prev_len_, SYNC_FILE_RANGE_WAIT_BEFORE)) return;

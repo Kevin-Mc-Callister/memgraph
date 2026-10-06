@@ -11,7 +11,6 @@
 
 #include "storage/v2/vertex_accessor.hpp"
 #include <range/v3/all.hpp>
-#include "query/exceptions.hpp"
 #include "storage/v2/constraints/constraint_violation.hpp"
 #include "storage/v2/constraints/type_constraints_kind.hpp"
 #include "storage/v2/disk/storage.hpp"
@@ -44,15 +43,19 @@ namespace memgraph::storage {
 
 namespace {
 void HandleTypeConstraintViolation(Storage const *storage, ConstraintViolation const &violation) {
-  throw query::QueryException("IS TYPED {} violation on {}({})",
-                              TypeConstraintKindToString(*violation.constraint_kind),
-                              storage->LabelToName(violation.label),
-                              storage->PropertyToName(*violation.properties.begin()));
+  throw TypeConstraintViolationException("IS TYPED {} violation on {}({})",
+                                         TypeConstraintKindToString(*violation.constraint_kind),
+                                         storage->LabelToName(violation.label),
+                                         storage->PropertyToName(*violation.properties.begin()));
 }
 
 std::optional<PropertyValue> TryConvertToVectorIndexProperty(Storage *storage, Vertex *vertex, PropertyId property,
                                                              const PropertyValue &value) {
+  // An older main sends [] as a tag with no vector; store it as the plain list it stands for.
+  if (value.IsVectorIndexId() && value.ValueVectorIndexList().empty()) return PropertyValue(std::vector<double>{});
   if (!value.IsAnyList() || value.IsVectorIndexId()) return std::nullopt;
+  // An empty list has no vector to index; keep it as a plain list so the vertex leaves the index.
+  if (value.ListSize() == 0) return std::nullopt;
   auto vector_index_ids = storage->indices_.vector_index_.GetVectorIndexIdsForVertex(vertex, property);
   if (vector_index_ids.empty()) return std::nullopt;
   return PropertyValue(
@@ -356,6 +359,30 @@ Result<bool> VertexAccessor::HasLabel(LabelId label, View view) const {
   if (!exists) return std::unexpected{Error::NONEXISTENT_OBJECT};
   if (!for_deleted_ && deleted) return std::unexpected{Error::DELETED_OBJECT};
   return has_label;
+}
+
+Result<bool> VertexAccessor::HasAnyLabel(View view) const {
+  bool deleted = false;
+  bool has_any_label = false;
+  Delta const *delta = nullptr;
+  VertexReadLock read_lock{vertex_};
+  {
+    auto const guard = read_lock.AcquireLock();
+    deleted = vertex_->deleted();
+    has_any_label = !vertex_->labels.empty();
+    delta = vertex_->delta();
+  }
+
+  // A delta adds or removes one named label, so which labels survive it decides whether any does: there is
+  // no answer short of the set itself.
+  if (delta && transaction_->isolation_level != IsolationLevel::READ_UNCOMMITTED) {
+    auto labels = Labels(view);
+    if (!labels) return std::unexpected{labels.error()};
+    return !labels->empty();
+  }
+
+  if (!for_deleted_ && deleted) return std::unexpected{Error::DELETED_OBJECT};
+  return has_any_label;
 }
 
 Result<VertexKey> VertexAccessor::Labels(View view) const {

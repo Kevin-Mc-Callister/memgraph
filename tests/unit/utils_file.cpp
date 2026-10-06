@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <climits>
 #include <cstdio>
 #include <fstream>
@@ -1087,10 +1088,10 @@ class FileCacheHintTest : public ::testing::Test {
 
   enum class PositionQueries : uint8_t { kNone, kEveryBatch };
 
-  // Residency of `path` once `data` has been streamed to it with pacing on, which is what says
-  // whether pacing disposed of the windows it completed.
-  static std::optional<double> ResidencyAfterPacedWrite(const fs::path &path, const std::vector<uint8_t> &data,
-                                                        PositionQueries queries) {
+  // How many windows pacing handed to writeback while `data` was streamed to `path`, which is what
+  // says whether pacing kept its place through whatever the stream did between writes.
+  static size_t WindowsCompletedByPacedWrite(const fs::path &path, const std::vector<uint8_t> &data,
+                                             PositionQueries queries) {
     PacedFile file;
     file.Open(path, PacedFile::Mode::OVERWRITE_EXISTING);
     file.EnableWritebackPacing(kWindow);
@@ -1099,9 +1100,9 @@ class FileCacheHintTest : public ::testing::Test {
       if (queries == PositionQueries::kEveryBatch) file.GetPosition();
     }
     file.Sync();
-    auto const resident = memgraph::test::ResidentFraction(path);
+    auto const windows = file.PacingWindowsCompleted();
     file.Close();
-    return resident;
+    return windows;
   }
 
   std::vector<uint8_t> ReadFileContents(const fs::path &path) const {
@@ -1226,33 +1227,25 @@ TEST_F(FileCacheHintTest, AppendingFromAnotherFileKeepsPacingAlignedWithTheFile)
 
 // Asking a file for its position seeks to where the file already is, and the snapshot writer asks at
 // every batch boundary. If that counted as a move it would abandon the window in flight each time,
-// so no window would ever be handed to writeback or dropped, which on a large snapshot is most of
-// the file. Residency is what shows it: the pacer's own offset is right either way.
-//
-// The baseline is the same write without the queries, and it is also the gate: whether pacing can
-// drop anything at all is a property of the filesystem, and one that `PageCacheEvictionObservable`
-// cannot answer, because it asks about a file that has been fsynced. On overlayfs, which is what a
-// container's own filesystem is, `sync_file_range` reports success having done nothing: it writes
-// back the mapping of the inode it is given, and the overlay inode holds no pages, they are all on
-// the upper filesystem's inode. The pages stay dirty, DONTNEED skips dirty pages, and nothing is
-// released. `fsync` is passed through to the upper file and so still works, which is why whole-file
-// eviction after a sync is observable there and this is not.
+// and no window would ever reach writeback. Judged by the windows pacing handed over, not by
+// residency afterwards: whether pages leave the cache is the filesystem's and the kernel's to
+// decide, and a runner under memory pressure reclaims pages the code never dropped.
 TEST_F(FileCacheHintTest, RepositioningToTheCurrentOffsetKeepsTheWindowInFlight) {
   const auto data = Pattern(kTotal);
 
-  const auto baseline = ResidencyAfterPacedWrite(test_dir_ / "streamed.bin", data, PositionQueries::kNone);
-  ASSERT_TRUE(baseline.has_value());
-  if (*baseline >= 0.5) {
-    GTEST_SKIP() << "paced writeback releases nothing under " << test_dir_ << ": a stream with no position query at all"
-                 << " left " << (*baseline * 100) << "% of the file cached";
+  const auto unqueried = WindowsCompletedByPacedWrite(test_dir_ / "streamed.bin", data, PositionQueries::kNone);
+  if (unqueried == 0) {
+    GTEST_SKIP() << "pacing turned itself off under " << test_dir_ << ": sync_file_range is refused there";
   }
+  ASSERT_EQ(unqueried, kTotal / kWindow) << "an append-only stream did not complete a window per kWindow bytes";
 
-  const auto resident =
-      ResidencyAfterPacedWrite(test_dir_ / "position_queried.bin", data, PositionQueries::kEveryBatch);
-  ASSERT_TRUE(resident.has_value());
-  EXPECT_LT(*resident, 0.5) << "asking for the position abandoned the window in flight: " << (*resident * 100)
-                            << "% of the file is still cached, against " << (*baseline * 100)
-                            << "% without the queries";
+  // A query flushes every chunk, so windows complete on chunk boundaries and each runs up to a chunk
+  // long; a restart at every query would let none of them fill.
+  const auto queried =
+      WindowsCompletedByPacedWrite(test_dir_ / "position_queried.bin", data, PositionQueries::kEveryBatch);
+  EXPECT_GE(queried, kTotal / (kWindow + kChunk))
+      << "asking for the position abandoned the window in flight: " << queried << " windows reached writeback, against "
+      << unqueried << " without the queries";
 }
 
 // `EnableWritebackPacing` is the one place that sets the window, and it must also reset where pacing
@@ -1352,6 +1345,28 @@ TEST_F(FileCacheHintTest, PacingDisablesItselfOnADescriptorItCannotPace) {
   EXPECT_EQ(file.PacingOffset(), after_failure) << "pacing kept running on a descriptor it cannot pace";
 
   file.Close();
+}
+
+// Whether the kernel took the advice is the one part of a release that does not depend on how much
+// memory the machine is under, and POSIX has a FIFO refuse with ESPIPE, so both answers are
+// reachable without an unusual filesystem. Acceptance is all that is claimed here, and it is weaker
+// than it sounds: a filesystem can answer zero and keep every page, which is why the tests that
+// measure eviction gate themselves on a probe rather than on this.
+TEST_F(FileCacheHintTest, DroppingReportsWhetherTheKernelTookTheAdvice) {
+  const auto path = test_dir_ / "advice.bin";
+  WriteStreaming(path, Pattern(kTotal), 0);
+
+  const int fd = ::open(path.c_str(), O_RDONLY);
+  ASSERT_NE(fd, -1);
+  const auto close_fd = memgraph::utils::OnScopeExit{[fd] { ::close(fd); }};
+  EXPECT_EQ(memgraph::utils::DropCachedPages(fd), 0) << "a regular file is a descriptor the advice applies to";
+
+  const auto fifo = test_dir_ / "fifo";
+  ASSERT_EQ(::mkfifo(fifo.c_str(), 0600), 0);
+  const int fifo_fd = ::open(fifo.c_str(), O_RDONLY | O_NONBLOCK);
+  ASSERT_NE(fifo_fd, -1);
+  const auto close_fifo = memgraph::utils::OnScopeExit{[fifo_fd] { ::close(fifo_fd); }};
+  EXPECT_EQ(memgraph::utils::DropCachedPages(fifo_fd), ESPIPE) << "a refusal must reach the caller unchanged";
 }
 
 // Recovery releases the snapshot through the same handle it read it with, once the load is done.

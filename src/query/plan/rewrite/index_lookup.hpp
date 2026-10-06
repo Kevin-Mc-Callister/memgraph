@@ -128,13 +128,8 @@ struct IndexHints {
 
   template <class TDbAccessor>
   bool HasLabelIndex(TDbAccessor *db, storage::LabelId label) const {
-    for (const auto &[index_type, label_hint, _] : label_index_hints_) {
-      auto label_id = db->NameToLabel(label_hint.name);
-      if (label_id == label) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(label_index_hints_,
+                               [&](auto const &hint) { return db->NameToLabel(hint.label_ix_.name) == label; });
   }
 
   template <class TDbAccessor>
@@ -158,24 +153,17 @@ struct IndexHints {
   // TODO: look into making index hints work for point indexes
   template <class TDbAccessor>
   bool HasPointIndex(TDbAccessor *db, storage::LabelId label, storage::PropertyId property) const {
-    for (const auto &[index_type, label_hint, property_hint] : point_index_hints_) {
-      auto label_id = db->NameToLabel(label_hint.name);
-      auto property_id = db->NameToProperty(property_hint[0].path[0].name);
-      if (label_id == label && property_id == property) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(point_index_hints_, [&](auto const &hint) {
+      return db->NameToLabel(hint.label_ix_.name) == label &&
+             db->NameToProperty(hint.property_ixs_[0].path[0].name) == property;
+    });
   }
 
   template <class TDbAccessor>
   bool HasVertexPropertyIndex(TDbAccessor *db, storage::PropertyId property) const {
-    for (const auto &[index_type, label_hint, property_ixs] : vertex_property_index_hints_) {
-      if (db->NameToProperty(property_ixs[0].path[0].name) == property) {
-        return true;
-      }
-    }
-    return false;
+    return std::ranges::any_of(vertex_property_index_hints_, [&](auto const &hint) {
+      return db->NameToProperty(hint.property_ixs_[0].path[0].name) == property;
+    });
   }
 
   std::vector<IndexHint> label_index_hints_{};
@@ -215,7 +203,7 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
 
   bool PreVisit(Filter &op) override {
     prev_ops_.push_back(&op);
-    filters_.CollectFilterExpression(op.expression_, *symbol_table_);
+    filters_.AddOperatorFilters(op.expression_, *symbol_table_, *ast_storage_);
     return true;
   }
 
@@ -225,11 +213,12 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
   bool PostVisit(Filter &op) override {
     prev_ops_.pop_back();
 
-    // Predicates we consumed here. The Cartesian decision below needs these, not the leftovers.
+    // Predicates we consumed here. The Cartesian decision below needs these, not the leftovers. Collected the
+    // same way as the ones the removal set was built from, so a filter is the same filter in both.
     std::vector<FilterInfo> removed_filters;
     {
       Filters own_filters;
-      own_filters.CollectFilterExpression(op.expression_, *symbol_table_);
+      own_filters.AddOperatorFilters(op.expression_, *symbol_table_, *ast_storage_);
       for (auto const &filter : own_filters) {
         if (filter_exprs_for_removal_.contains(filter.expression)) {
           removed_filters.push_back(filter);
@@ -240,9 +229,7 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
     ExpressionRemovalResult removal = RemoveExpressions(op.expression_, filter_exprs_for_removal_, ast_storage_);
     op.expression_ = removal.trimmed_expression;
     if (op.expression_) {
-      Filters leftover_filters;
-      leftover_filters.CollectFilterExpression(op.expression_, *symbol_table_);
-      op.all_filters_ = std::move(leftover_filters);
+      op.all_filters_ = Filters::FromExpression(op.expression_, *symbol_table_, *ast_storage_);
     }
 
     // A Cartesian pulls its right branch once per pass, not once per left row, so it cannot feed a
@@ -322,28 +309,6 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
     return true;
   }
 
-  bool PreVisit(ScanAllByEdgeTypePropertyValue &op) override {
-    prev_ops_.push_back(&op);
-    return true;
-  }
-
-  bool PostVisit(ScanAllByEdgeTypePropertyValue &op) override {
-    prev_ops_.pop_back();
-    return true;
-  }
-
-  bool PreVisit(ScanAllByEdgeTypePropertyRange &op) override {
-    prev_ops_.push_back(&op);
-    return true;
-  }
-
-  bool PostVisit(ScanAllByEdgeTypePropertyRange &op) override {
-    prev_ops_.pop_back();
-    // Edge range scans don't exist yet — they're created by EdgeIndexRewriter which runs after this pass.
-    // ORDER BY elimination for edge scans is handled there.
-    return true;
-  }
-
   bool PreVisit(ScanAllByEdgeProperty &op) override {
     prev_ops_.push_back(&op);
     return true;
@@ -351,27 +316,6 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
 
   bool PostVisit(ScanAllByEdgeProperty &op) override {
     prev_ops_.pop_back();
-    return true;
-  }
-
-  bool PreVisit(ScanAllByEdgePropertyValue &op) override {
-    prev_ops_.push_back(&op);
-    return true;
-  }
-
-  bool PostVisit(ScanAllByEdgePropertyValue &op) override {
-    prev_ops_.pop_back();
-    return true;
-  }
-
-  bool PreVisit(ScanAllByEdgePropertyRange &op) override {
-    prev_ops_.push_back(&op);
-    return true;
-  }
-
-  bool PostVisit(ScanAllByEdgePropertyRange &op) override {
-    prev_ops_.pop_back();
-    // See PostVisit(ScanAllByEdgeTypePropertyRange) above.
     return true;
   }
 
@@ -902,7 +846,8 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
   bool PreVisit(RollUpApply &op) override {
     prev_ops_.push_back(&op);
     op.input()->Accept(*this);
-    RewriteBranch(&op.list_collection_branch_);
+    // The branch runs on the row the input produced, so it can use an index on what the input bound.
+    RewriteBranch(&op.list_collection_branch_, InheritedFor(op));
     return false;
   }
 
@@ -1175,12 +1120,6 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
 
   using CandidateLabelPropertiesIndices =
       std::multimap<std::pair<LabelIx, std::vector<query::PropertyIxPath>>, LabelPropertiesIndexCandidate, std::less<>>;
-
-  // A correlated string predicate is left as a filter over a scan; see PropertyFilter::IsStringPredicate.
-  static bool IsCorrelatedStringPredicate(const Symbol &scanned_symbol, FilterInfo const &filter) {
-    if (!PropertyFilter::IsStringPredicate(filter.property_filter->type_)) return false;
-    return std::ranges::any_of(filter.used_symbols, [&scanned_symbol](Symbol const &s) { return s != scanned_symbol; });
-  }
 
   // Whether a scan of `scanned_symbol` may read this filter's value expression. Every path that
   // hands a filter to a scan asks here, so none of them can admit a value the scan cannot evaluate
@@ -1685,6 +1624,9 @@ class IndexLookupRewriter final : public HierarchicalLogicalOperatorVisitor {
         for (auto *elem : list->elements_) {
           auto resolved = ExpressionRange::Equal(elem).ResolveAtPlantime(parameters_, mapper);
           if (!resolved) return static_cast<double>(db_->VerticesCount(scan_op->property_));
+          // The same rule the single-value path above follows: an empty range carries no bounds,
+          // and it counts for nothing rather than being read as one.
+          if (resolved->type_ == storage::PropertyRangeType::INVALID) continue;
           sum += db_->VerticesCount(scan_op->property_, resolved->lower_->value());
         }
         return sum;

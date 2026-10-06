@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 # Help function
@@ -24,6 +24,8 @@ OPTIONS:
     --update-lockfile       Update conan.lock before installing dependencies
     --graph-info            Generate dependency graph as graph.html and exit
     --split-debug           Extract debug info into sidecar .debug files (requires RelWithDebInfo/Debug)
+    --fips                  Build for a FIPS 140-3 approved-mode image (maps to -DMG_FIPS=ON; omits
+                            components whose crypto cannot come from the validated OpenSSL)
     --mage MODE             MAGE query modules (C++, Python, Rust). MODE is one of:
                               off  = no MAGE (default)
                               on   = build MAGE together with Memgraph
@@ -111,6 +113,7 @@ COMPILE_JOBS=""
 LINK_JOBS=""
 JOB_MEMORY_CAP=on
 SPLIT_DEBUG=off
+FIPS=off
 PROFILING=""
 MAGE=off
 CUGRAPH=off
@@ -185,6 +188,10 @@ while [[ $# -gt 0 ]]; do
             SPLIT_DEBUG=on
             shift
             ;;
+        --fips)
+            FIPS=on
+            shift
+            ;;
         --mage)
             MAGE="$2"
             shift 2
@@ -247,6 +254,10 @@ fi
 
 if [[ "$SPLIT_DEBUG" == "on" ]]; then
     CMAKE_ARGS="$CMAKE_ARGS -DMG_SPLIT_DEBUG=ON"
+fi
+
+if [[ "$FIPS" == "on" ]]; then
+    CMAKE_ARGS="$CMAKE_ARGS -DMG_FIPS=ON"
 fi
 
 if [[ ! "$CMAKE_ARGS" =~ MG_PYTHON_SUPPORT ]]; then
@@ -324,13 +335,39 @@ if [[ "$BUILD_TYPE" != "Release" && "$BUILD_TYPE" != "RelWithDebInfo" && "$BUILD
     exit 1
 fi
 
-# Initialize arrays for arguments
-HOST_PROFILES=("-pr:h" "memgraph_toolchain_v8")
+# Which profiles describe this host, and whether it has a bundled toolchain to build
+# against. Hosts without one use their system compiler, so nothing here may assume the
+# toolchain's directory layout exists.
+BUNDLED_TOOLCHAIN=true
+case "$DISTRO" in
+    freebsd-*)
+        BUNDLED_TOOLCHAIN=false
+        HOST_PROFILES=("-pr:h" "memgraph_freebsd")
+        BUILD_PROFILE="memgraph_freebsd_build"
+        ;;
+    *)
+        HOST_PROFILES=("-pr:h" "memgraph_toolchain_v8")
+        BUILD_PROFILE="memgraph_build_profile"
+        ;;
+esac
+
 CONAN_COMMON_ARGS=(
-  -pr:b memgraph_build_profile
+  -pr:b "$BUILD_PROFILE"
   -s build_type="$BUILD_TYPE"
   -s os.distro="$DISTRO"
 )
+
+# Every conan invocation runs through this, so the toolchain root is named once and
+# only where there is a bundled toolchain to point at. Whether one is used at all is
+# the profile's to say, and conan carries that into the CMake preset it generates.
+CONAN_ENV=(env)
+if [[ "$BUNDLED_TOOLCHAIN" = true ]]; then
+    CONAN_ENV+=("MG_TOOLCHAIN_ROOT=/opt/toolchain-v8")
+else
+    # Tools taken from the platform appear as references the Linux lockfile does not
+    # carry, so the lock can constrain what it knows and no more.
+    CONAN_COMMON_ARGS+=("--lockfile-partial")
+fi
 
 if [[ "$offline" = true ]]; then
     CONAN_COMMON_ARGS+=("--no-remote")
@@ -443,7 +480,7 @@ fi
 # generate dependency graph and exit early
 if [[ "$graph_info" = true ]]; then
     echo "Generating dependency graph -> graph.html"
-    MG_TOOLCHAIN_ROOT="/opt/toolchain-v8" conan graph info . \
+    "${CONAN_ENV[@]}" conan graph info . \
       "${HOST_PROFILES[@]}" "${CONAN_COMMON_ARGS[@]}" \
       --format=html > graph.html
     echo "Open graph.html in a browser to view the dependency graph"
@@ -455,7 +492,7 @@ if [[ "$update_lockfile" = true ]]; then
     echo "Updating conan.lock"
     # Resolve recipe revisions from remotes (including local-recipes-index),
     # not from any stale local cache export, so lockfiles stay portable.
-    MG_TOOLCHAIN_ROOT="/opt/toolchain-v8" conan lock create . \
+    "${CONAN_ENV[@]}" conan lock create . \
       "${HOST_PROFILES[@]}" "${CONAN_COMMON_ARGS[@]}" \
       --update \
       --lockfile="" \
@@ -463,7 +500,7 @@ if [[ "$update_lockfile" = true ]]; then
 fi
 
 # install conan dependencies
-MG_TOOLCHAIN_ROOT="/opt/toolchain-v8" conan install . --build=missing \
+"${CONAN_ENV[@]}" conan install . --build=missing \
   "${HOST_PROFILES[@]}" "${CONAN_COMMON_ARGS[@]}"
 
 source build/generators/conanbuild.sh

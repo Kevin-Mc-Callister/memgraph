@@ -114,6 +114,12 @@ class TypedValue {
     VirtualNode
   };
 
+  /// How many types a value can be, read off the last enumerator above.
+  ///
+  /// Kept beside the enumeration rather than beside any one table built over
+  /// it, so that a type added here is counted everywhere at once.
+  static constexpr auto kTypeCount = static_cast<unsigned>(Type::VirtualNode) + 1U;
+
   // TypedValue at this exact moment of compilation is an incomplete type, and
   // the standard says that instantiating a container with an incomplete type
   // invokes undefined behaviour. The libstdc++-8.3.0 we are using supports
@@ -616,54 +622,9 @@ class TypedValue {
    */
   friend TypedValue operator!=(const TypedValue &a, const TypedValue &b) { return !(a == b); }
 
-  /**
-   * Compare TypedValues and return true, false or Null.
-   *
-   * Null is returned if either of the two values is Null.
-   * The resulting value uses the same MemoryResource as the left hand side
-   * argument.
-   *
-   * @throw TypedValueException if the values cannot be compared, i.e. they are
-   *        not either Null, numeric or a character string type.
-   */
-  friend TypedValue operator<(const TypedValue &a, const TypedValue &b);
-
-  /**
-   * Compare TypedValues and return true, false or Null.
-   *
-   * Null is returned if either of the two values is Null.
-   * The resulting value uses the same MemoryResource as the left hand side
-   * argument.
-   *
-   * @throw TypedValueException if the values cannot be compared, i.e. they are
-   *        not either Null, numeric or a character string type.
-   */
-  // TODO: why not `!(b < a)` or C++20 auto generated
-  friend TypedValue operator<=(const TypedValue &a, const TypedValue &b) { return a < b || a == b; }
-
-  /**
-   * Compare TypedValues and return true, false or Null.
-   *
-   * Null is returned if either of the two values is Null.
-   * The resulting value uses the same MemoryResource as the left hand side
-   * argument.
-   *
-   * @throw TypedValueException if the values cannot be compared, i.e. they are
-   *        not either Null, numeric or a character string type.
-   */
-  friend TypedValue operator>(const TypedValue &a, const TypedValue &b) { return !(a <= b); }
-
-  /**
-   * Compare TypedValues and return true, false or Null.
-   *
-   * Null is returned if either of the two values is Null.
-   * The resulting value uses the same MemoryResource as the left hand side
-   * argument.
-   *
-   * @throw TypedValueException if the values cannot be compared, i.e. they are
-   *        not either Null, numeric or a character string type.
-   */
-  friend TypedValue operator>=(const TypedValue &a, const TypedValue &b) { return !(a < b); }
+  // The four ordered comparisons are the presentation surface over
+  // comparability and live with that relation, so a caller asking one includes
+  // the relation it reads.
 
   // arithmetic operators
 

@@ -365,25 +365,19 @@ inline bool CanSeeEntityWithTimestamp(uint64_t insertion_timestamp, Transaction 
   return insertion_timestamp <= original_start_timestamp;
 }
 
-// A range covering a whole type is expressed as the type's own lower bound together with an
-// exclusive upper bound of the *following* type (see LowerBoundForType/UpperBoundForType), so that
-// one shape legitimately has bounds of differing types. Both ends must match for it to be that
-// marker rather than a user-written range that merely reaches the same boundary value; every other
-// type mismatch describes an empty range.
+// Two bounds a range may be read from: either the value types can be compared, or the pair is the
+// marker for one whole stretch of the order, whose ends are of two types on purpose. Every other
+// pair of two types describes an empty range.
 inline bool AreComparableBounds(utils::Bound<PropertyValue> const &lower_bound,
                                 utils::Bound<PropertyValue> const &upper_bound) {
-  if (AreComparableTypes(lower_bound.value().type(), upper_bound.value().type())) return true;
-  if (upper_bound.IsInclusive() || !lower_bound.IsInclusive()) return false;
-  auto const lower_bound_for_type = LowerBoundForType(lower_bound.value().type());
-  auto const upper_bound_for_type = UpperBoundForType(lower_bound.value().type());
-  return lower_bound_for_type && upper_bound_for_type && lower_bound.value() == lower_bound_for_type->value() &&
-         upper_bound.value() == upper_bound_for_type->value();
+  return AreComparable(lower_bound.value(), upper_bound.value()) ||
+         BoundsRunToTheEndOfAStretch(lower_bound, upper_bound);
 }
 
 // `allow_whole_type_span` admits the bound pair that marks an entire type (see AreComparableBounds).
 // Only pass it where the query layer has already discarded a user range whose bounds cannot be
-// compared -- a scan driven by an ExpressionRange, which is marked INVALID in that case. Scans that
-// carry raw bounds, i.e. every edge scan, have no such marking and must stay strict, or a range like
+// compared -- a scan driven by an ExpressionRange, which is marked INVALID in that case. A scan
+// carrying raw bounds has no such marking and must stay strict, or a range like
 // `e.p >= -inf AND e.p < ''` is mistaken for the marker and returns every number.
 inline bool ValidateBounds(std::optional<utils::Bound<PropertyValue>> &lower_bound,
                            std::optional<utils::Bound<PropertyValue>> &upper_bound,
@@ -403,19 +397,18 @@ inline bool ValidateBounds(std::optional<utils::Bound<PropertyValue>> &lower_bou
 
   // Check whether the bounds are of comparable types if both are supplied.
   if (lower_bound && upper_bound) {
-    auto const comparable = allow_whole_type_span
-                                ? AreComparableBounds(*lower_bound, *upper_bound)
-                                : AreComparableTypes(lower_bound->value().type(), upper_bound->value().type());
+    auto const comparable = allow_whole_type_span ? AreComparableBounds(*lower_bound, *upper_bound)
+                                                  : AreComparable(lower_bound->value(), upper_bound->value());
     if (!comparable || lower_bound->value() > upper_bound->value()) {
       return false;
     }
   }
   // Set missing bounds.
   if (lower_bound && !upper_bound) {
-    upper_bound = UpperBoundForType(lower_bound->value().type());
+    upper_bound = UpperBoundComparableWith(lower_bound->value());
   }
   if (upper_bound && !lower_bound) {
-    lower_bound = LowerBoundForType(upper_bound->value().type());
+    lower_bound = LowerBoundComparableWith(upper_bound->value());
   }
   return true;
 }
@@ -430,7 +423,7 @@ inline auto MakeBoundsFromRange(PropertyValueRange const &range) -> LowerAndUppe
   if (range.type_ == PropertyRangeType::INVALID) {
     return {std::nullopt, std::nullopt, false};
   } else if (range.type_ == PropertyRangeType::IS_NOT_NULL) {
-    lower_bound = LowerBoundForType(PropertyValueType::Bool);
+    upper_bound = UpperBoundForNonNulls();
   } else if (range.type_ == PropertyRangeType::BOUNDED) {
     // We have to fix the bounds that the user provided to us. If the user
     // provided only one bound we should make sure that only values of that type
@@ -457,14 +450,14 @@ inline auto MakeBoundsFromRange(PropertyValueRange const &range) -> LowerAndUppe
     // Set missing bounds.
     if (lower_bound && !upper_bound) {
       // Here we need to supply an upper bound. The upper bound is set to an
-      // exclusive lower bound of the following type.
-      upper_bound = UpperBoundForType(lower_bound->value().type());
+      // exclusive lower bound of the following stretch of the order.
+      upper_bound = UpperBoundComparableWith(lower_bound->value());
     }
 
     if (upper_bound && !lower_bound) {
       // Here we need to supply a lower bound. The lower bound is set to an
-      // inclusive lower bound of the current type.
-      lower_bound = LowerBoundForType(upper_bound->value().type());
+      // inclusive lower bound of the current stretch of the order.
+      lower_bound = LowerBoundComparableWith(upper_bound->value());
     }
   }
 

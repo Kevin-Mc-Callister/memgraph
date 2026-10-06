@@ -18,6 +18,7 @@
 #include "storage/v2/id_types.hpp"
 #include "storage/v2/indices/active_indices_updater.hpp"
 #include "storage/v2/indices/indices_utils.hpp"
+#include "storage/v2/inmemory/all_indices_cleanup.hpp"
 #include "storage/v2/inmemory/storage.hpp"
 #include "storage/v2/interesting_ids.hpp"
 #include "storage/v2/property_constants.hpp"
@@ -124,7 +125,8 @@ inline void TryInsertEdgeTypePropertyIndex(Vertex &from_vertex, EdgeTypeId edge_
 void AdvanceUntilValid_(auto &index_iterator, const auto &end, EdgeRef &current_edge, EdgeAccessor &current_accessor,
                         PropertyId property, const std::optional<utils::Bound<PropertyValue>> &lower_bound,
                         const std::optional<utils::Bound<PropertyValue>> &upper_bound, View view, Storage *storage,
-                        Transaction *transaction, EdgeTypeId edge_type, Gid max_gid) {
+                        Transaction *transaction, EdgeTypeId edge_type, Gid max_gid,
+                        PropertyValueRange::ValuePredicateFn const *value_predicate) {
   for (; index_iterator != end; ++index_iterator) {
     if (index_iterator->edge == current_edge.ptr) {
       continue;
@@ -137,6 +139,10 @@ void AdvanceUntilValid_(auto &index_iterator, const auto &end, EdgeRef &current_
     if (!IsValueIncludedByUpperBound(index_iterator->value, upper_bound)) {
       index_iterator = end;
       break;
+    }
+
+    if (value_predicate && !(*value_predicate)(index_iterator->value)) {
+      continue;
     }
 
     // Visibility filters run after the value-bounds check: bounds depend only on the
@@ -317,43 +323,43 @@ uint64_t InMemoryEdgeTypePropertyIndex::RemoveObsoleteEntries(Storage *storage, 
 
   auto const preserve_recent_entries = SweepPreservesRecentEntries(storage->GetStorageMode());
 
-  uint64_t swept = 0;
-  for (auto &[index, property] : *all_indices) {
-    if (token.stop_requested()) return swept;
-    // A sweep walks the whole index whether or not it has anything to collect.
-    if (!arming.arms_edge_index_on(property)) continue;
-    ++swept;
+  return SweepArmedIndexes(
+      arming,
+      token,
+      *all_indices,
+      [](auto const &entry) { return EdgePropertyKey{.property = entry.property_}; },
+      [&](auto const &entry) {
+        auto const &property = entry.property_;
+        auto edges_acc = entry.index_->skiplist.access();
+        for (auto it = edges_acc.begin(); it != edges_acc.end();) {
+          if (maybe_stop() && token.stop_requested()) return SweepOutcome::STOPPED;
 
-    auto edges_acc = index->skiplist.access();
-    for (auto it = edges_acc.begin(); it != edges_acc.end();) {
-      if (maybe_stop() && token.stop_requested()) return swept;
+          auto next_it = it;
+          ++next_it;
 
-      auto next_it = it;
-      ++next_it;
+          if (preserve_recent_entries && it->timestamp >= oldest_active_start_timestamp) {
+            it = next_it;
+            continue;
+          }
 
-      if (preserve_recent_entries && it->timestamp >= oldest_active_start_timestamp) {
-        it = next_it;
-        continue;
-      }
+          const bool has_next = next_it != edges_acc.end();
 
-      const bool has_next = next_it != edges_acc.end();
+          // When we update specific entries in the index, we don't delete the previous entry.
+          // The way they are removed from the index is through this check. The entries should
+          // be right next to each other(in terms of iterator semantics) and the older one
+          // should be removed here.
+          const bool redundant_duplicate = has_next && it->value == next_it->value &&
+                                           it->from_vertex == next_it->from_vertex &&
+                                           it->to_vertex == next_it->to_vertex && it->edge == next_it->edge;
+          if (redundant_duplicate ||
+              !AnyVersionHasProperty(*it->edge, property, it->value, oldest_active_start_timestamp)) {
+            edges_acc.remove(*it);
+          }
 
-      // When we update specific entries in the index, we don't delete the previous entry.
-      // The way they are removed from the index is through this check. The entries should
-      // be right next to each other(in terms of iterator semantics) and the older one
-      // should be removed here.
-      const bool redundant_duplicate = has_next && it->value == next_it->value &&
-                                       it->from_vertex == next_it->from_vertex && it->to_vertex == next_it->to_vertex &&
-                                       it->edge == next_it->edge;
-      if (redundant_duplicate ||
-          !AnyVersionHasProperty(*it->edge, property, it->value, oldest_active_start_timestamp)) {
-        edges_acc.remove(*it);
-      }
-
-      it = next_it;
-    }
-  }
-  return swept;
+          it = next_it;
+        }
+        return SweepOutcome::COMPLETED;
+      });
 }
 
 void InMemoryEdgeTypePropertyIndex::ActiveIndices::AbortEntries(
@@ -443,14 +449,26 @@ InMemoryEdgeTypePropertyIndex::Iterable::Iterable(
     PropertyId property, const std::optional<utils::Bound<PropertyValue>> &lower_bound,
     const std::optional<utils::Bound<PropertyValue>> &upper_bound, View view, Storage *storage,
     Transaction *transaction, Gid max_gid)
+    : Iterable(std::move(index_accessor), std::move(vertex_accessor), std::move(edge_pin), edge_type, property,
+               PropertyValueRange::Bounded(lower_bound, upper_bound), view, storage, transaction, max_gid) {}
+
+InMemoryEdgeTypePropertyIndex::Iterable::Iterable(utils::SkipListDb<Entry>::Accessor index_accessor,
+                                                  utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor,
+                                                  EdgePin edge_pin, EdgeTypeId edge_type, PropertyId property,
+                                                  PropertyValueRange const &range, View view, Storage *storage,
+                                                  Transaction *transaction, Gid max_gid)
     : pin_accessor_edge_(std::move(edge_pin)),
       pin_accessor_vertex_(std::move(vertex_accessor)),
       index_accessor_(std::move(index_accessor)),
       edge_type_(edge_type),
       property_(property),
-      lower_bound_(lower_bound),
-      upper_bound_(upper_bound),
-      bounds_valid_(ValidateBounds(lower_bound_, upper_bound_)),
+      lower_bound_(range.lower_),
+      upper_bound_(range.upper_),
+      value_predicate_(range.GetValuePredicate()),
+      // A range no value satisfies says so by its type, having no pair of bounds that would, so a
+      // scan reading only the bounds would read the whole index.
+      bounds_valid_(range.type_ != PropertyRangeType::INVALID &&
+                    ValidateBounds(lower_bound_, upper_bound_, /*allow_whole_type_span=*/true)),
       view_(view),
       storage_(storage),
       transaction_(transaction),
@@ -483,7 +501,8 @@ void InMemoryEdgeTypePropertyIndex::Iterable::Iterator::AdvanceUntilValid() {
                      self_->storage_,
                      self_->transaction_,
                      self_->edge_type_,
-                     self_->max_gid_);
+                     self_->max_gid_,
+                     self_->value_predicate_.get());
 }
 
 void InMemoryEdgeTypePropertyIndex::RunGC() {
@@ -520,6 +539,53 @@ InMemoryEdgeTypePropertyIndex::Iterable InMemoryEdgeTypePropertyIndex::ActiveInd
           view,
           storage,
           transaction,
+          max_gid};
+}
+
+InMemoryEdgeTypePropertyIndex::Iterable InMemoryEdgeTypePropertyIndex::ActiveIndices::Edges(
+    EdgeTypeId edge_type, PropertyId property, utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor,
+    PropertyValueRange const &range, View view, Storage *storage, Transaction *transaction) {
+  auto it = index_container_->find({edge_type, property});
+  MG_ASSERT(it != index_container_->end(),
+            "Index for edge type {} and property {} doesn't exist",
+            edge_type.AsUint(),
+            property.AsUint());
+  // Pin before snapshotting max_gid so the accessor epoch covers everything the scan may touch.
+  auto edge_pin = static_cast<InMemoryStorage const *>(storage)->MakeEdgePin();
+  const auto max_gid = Gid::FromUint(storage->edge_id_.load(std::memory_order_acquire));
+  return {it->second->skiplist.access(),
+          std::move(vertex_accessor),
+          std::move(edge_pin),
+          edge_type,
+          property,
+          range,
+          view,
+          storage,
+          transaction,
+          max_gid};
+}
+
+InMemoryEdgeTypePropertyIndex::ChunkedIterable InMemoryEdgeTypePropertyIndex::ActiveIndices::ChunkedEdges(
+    EdgeTypeId edge_type, PropertyId property, utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor,
+    PropertyValueRange const &range, View view, Storage *storage, Transaction *transaction, size_t num_chunks) {
+  auto it = index_container_->find({edge_type, property});
+  MG_ASSERT(it != index_container_->end(),
+            "Index for edge type {} and property {} doesn't exist",
+            edge_type.AsUint(),
+            property.AsUint());
+  // Pin before snapshotting max_gid so the accessor epoch covers everything the scan may touch.
+  auto edge_pin = static_cast<InMemoryStorage const *>(storage)->MakeEdgePin();
+  const auto max_gid = Gid::FromUint(storage->edge_id_.load(std::memory_order_acquire));
+  return {it->second->skiplist.access(),
+          std::move(vertex_accessor),
+          std::move(edge_pin),
+          edge_type,
+          property,
+          range,
+          view,
+          storage,
+          transaction,
+          num_chunks,
           max_gid};
 }
 
@@ -585,12 +651,7 @@ auto InMemoryEdgeTypePropertyIndex::GetIndividualIndex(EdgeTypeId edge_type, Pro
 }
 
 void InMemoryEdgeTypePropertyIndex::CleanupAllIndices() {
-  all_indices_.WithLock([](std::shared_ptr<std::vector<AllIndicesEntry> const> &indices) {
-    auto keep_condition = [](AllIndicesEntry const &entry) { return entry.index_.use_count() != 1; };
-    if (!r::all_of(*indices, keep_condition)) {
-      indices = std::make_shared<std::vector<AllIndicesEntry>>(*indices | rv::filter(keep_condition) | r::to_vector);
-    }
-  });
+  storage::CleanupAllIndices(all_indices_, [](AllIndicesEntry const &e) { return e.index_.use_count(); });
 }
 
 InMemoryEdgeTypePropertyIndex::ChunkedIterable::ChunkedIterable(
@@ -599,14 +660,27 @@ InMemoryEdgeTypePropertyIndex::ChunkedIterable::ChunkedIterable(
     PropertyId property, const std::optional<utils::Bound<PropertyValue>> &lower_bound,
     const std::optional<utils::Bound<PropertyValue>> &upper_bound, View view, Storage *storage,
     Transaction *transaction, size_t num_chunks, Gid max_gid)
+    : ChunkedIterable(std::move(index_accessor), std::move(vertex_accessor), std::move(edge_pin), edge_type, property,
+                      PropertyValueRange::Bounded(lower_bound, upper_bound), view, storage, transaction, num_chunks,
+                      max_gid) {}
+
+InMemoryEdgeTypePropertyIndex::ChunkedIterable::ChunkedIterable(
+    utils::SkipListDb<InMemoryEdgeTypePropertyIndex::Entry>::Accessor index_accessor,
+    utils::SkipListDb<Vertex>::ConstAccessor vertex_accessor, EdgePin edge_pin, EdgeTypeId edge_type,
+    PropertyId property, PropertyValueRange const &range, View view, Storage *storage, Transaction *transaction,
+    size_t num_chunks, Gid max_gid)
     : pin_accessor_edge_(std::move(edge_pin)),
       pin_accessor_vertex_(std::move(vertex_accessor)),
       index_accessor_(std::move(index_accessor)),
       edge_type_(edge_type),
       property_(property),
-      lower_bound_(lower_bound),
-      upper_bound_(upper_bound),
-      bounds_valid_(ValidateBounds(lower_bound_, upper_bound_)),
+      lower_bound_(range.lower_),
+      upper_bound_(range.upper_),
+      value_predicate_(range.GetValuePredicate()),
+      // A range no value satisfies says so by its type, having no pair of bounds that would, so a
+      // scan reading only the bounds would read the whole index.
+      bounds_valid_(range.type_ != PropertyRangeType::INVALID &&
+                    ValidateBounds(lower_bound_, upper_bound_, /*allow_whole_type_span=*/true)),
       view_(view),
       storage_(storage),
       transaction_(transaction),
@@ -637,7 +711,8 @@ void InMemoryEdgeTypePropertyIndex::ChunkedIterable::Iterator::AdvanceUntilValid
                      self_->storage_,
                      self_->transaction_,
                      self_->edge_type_,
-                     self_->max_gid_);
+                     self_->max_gid_,
+                     self_->value_predicate_.get());
 }
 
 }  // namespace memgraph::storage

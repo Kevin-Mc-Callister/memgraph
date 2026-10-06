@@ -26,6 +26,10 @@ class Memgraph(ConanFile):
         # CMake with MG_BUILD_MEMGRAPH=OFF / MG_BUILD_MAGE=ON. Used by
         # `./build.sh --mage only`.
         "mage_only": [True, False],
+        # Build against the toolchain produced by environment/toolchain and ship its
+        # C++ runtime. Hosts that build with their own compiler turn this off, and the
+        # profile that describes such a host is where it belongs.
+        "bundled_toolchain": [True, False],
     }
 
     exports_sources = (
@@ -45,6 +49,7 @@ class Memgraph(ConanFile):
 
     default_options = {
         "mage_only": False,
+        "bundled_toolchain": True,
         "aws-sdk-cpp/*:config": True,
         "aws-sdk-cpp/*:s3": True,
         "aws-sdk-cpp/*:monitoring": False,
@@ -88,6 +93,8 @@ class Memgraph(ConanFile):
         # pulling liburing into the static link; flip to True (pulls
         # liburing via Conan) to opt back in.
         "rocksdb/*:with_liburing": False,
+        "openssl/*:shared": True,
+        "zlib/*:shared": True,
     }
 
     def requirements(self):
@@ -118,16 +125,17 @@ class Memgraph(ConanFile):
         self.requires("libbcrypt/1.0-memgraph")
         self.requires("librdkafka/2.14.2")
         self.requires("librdtsc/0.3-memgraph")
-        self.requires("libseccomp/2.6.0", options={"shared": True})
+        if self.settings.os == "Linux":
+            # seccomp is a Linux kernel interface and its recipe only supports Linux, so the
+            # dependency cannot be resolved elsewhere. src/auth still calls into it
+            # unconditionally, so a non-Linux build gets as far as compiling and then fails
+            # there; making that optional is separate work.
+            self.requires("libseccomp/2.6.0", options={"shared": True})
         self.requires("mgclient/1.8.0")
         self.requires("nuraft/2.1.0-memgraph")
-        has_sanitizers = any(self.settings.get_safe(f"compiler.{s}") for s in ("asan", "ubsan", "tsan"))
-        openssl_shared = not has_sanitizers
-        # Production builds dynamically link OpenSSL so the binary can use any system-provided
-        # OpenSSL >=3 and <4. Sanitizer builds use static OpenSSL to avoid ASAN-instrumented
-        # libcrypto.so leaking into LD_LIBRARY_PATH and breaking autotools configure scripts
-        # of other dependencies during the Conan build.
-        self.requires("openssl/3.0.18", options={"shared": openssl_shared})
+        # Whether this is shared is set by "openssl/*:shared" in default_options, not here.
+        # Do not remove `override=True`: it pins one OpenSSL version across the graph.
+        self.requires("openssl/3.0.18", override=True)
         self.requires("protobuf/3.21.12")
         self.requires("pulsar-client-cpp/4.0.0-memgraph")
         self.requires("range-v3/0.12.0")
@@ -136,7 +144,7 @@ class Memgraph(ConanFile):
         self.requires("spdlog/1.17.0")
         self.requires("strong_type/v15")
         self.requires("usearch/2.21.4")
-        self.requires("zlib/1.3.1")
+        self.requires("zlib/1.3.1", override=True)
         self.requires("prometheus-cpp/1.3.0")
 
         # Version overrides — pin transitive dependency versions
@@ -161,9 +169,10 @@ class Memgraph(ConanFile):
 
     def validate(self):
         """Validate configuration before generation"""
-        # Memgraph only supports Linux
-        if self.settings.os != "Linux":
-            raise ConanInvalidConfiguration("Memgraph only supports Linux")
+        if self.settings.os not in ("Linux", "FreeBSD"):
+            raise ConanInvalidConfiguration(
+                f"Unsupported OS: {self.settings.os}. Only Linux and FreeBSD are supported."
+            )
 
         user_toolchain = self.conf.get("tools.cmake.cmaketoolchain:user_toolchain")
         if user_toolchain:
@@ -213,6 +222,8 @@ class Memgraph(ConanFile):
         if self.options.mage_only:
             tc.cache_variables["MG_BUILD_MEMGRAPH"] = "OFF"
             tc.cache_variables["MG_BUILD_MAGE"] = "ON"
+
+        tc.cache_variables["MG_BUNDLED_TOOLCHAIN"] = "ON" if self.options.bundled_toolchain else "OFF"
 
         tc.generate()
 
