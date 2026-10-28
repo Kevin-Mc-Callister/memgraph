@@ -18,12 +18,28 @@
 
 #include "utils/natural_sort.hpp"
 #include "utils/natural_sort_table.hpp"
+#include "utils/string.hpp"
 
 namespace {
 
 std::string Key(std::string_view s) {
   std::string out;
   memgraph::utils::NaturalSortKey(&out, s);
+  return out;
+}
+
+std::string Utf8(char32_t code_point) {
+  std::string out;
+  if (code_point < 0x80) {
+    out += static_cast<char>(code_point);
+  } else if (code_point < 0x800) {
+    out += static_cast<char>(0xC0 | (code_point >> 6));
+    out += static_cast<char>(0x80 | (code_point & 0x3F));
+  } else {
+    out += static_cast<char>(0xE0 | (code_point >> 12));
+    out += static_cast<char>(0x80 | ((code_point >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (code_point & 0x3F));
+  }
   return out;
 }
 
@@ -83,16 +99,27 @@ TEST(NaturalSortKey, KeyOfValidUtf8IsValidUtf8) {
   }
 }
 
-TEST(NaturalSortKey, TableIsSortedWithRanksInRange) {
-  using memgraph::utils::natural_sort::Kind;
-  using memgraph::utils::natural_sort::kMaxRank;
-  using memgraph::utils::natural_sort::kTable;
-  EXPECT_TRUE(std::ranges::is_sorted(kTable, std::ranges::less{}, &memgraph::utils::natural_sort::Entry::code_point));
-  for (auto const &entry : kTable) {
-    if (entry.kind == Kind::kMark) {
-      EXPECT_GE(entry.rank, 1);
-      EXPECT_LE(entry.rank, kMaxRank);
-    }
+TEST(NaturalSortKey, AppliesTheTable) {
+  using memgraph::utils::CountUtf8CodePoints;
+  namespace table = memgraph::utils::natural_sort;
+  for (auto const &[base, letters] : table::kFolds) {
+    std::string expected;
+    for (size_t i = 0; i < CountUtf8CodePoints(letters); ++i) expected += base;
+    EXPECT_EQ(Key(letters), expected) << letters;
+  }
+  // Every character of a group has the group's mark, and groups rank in order.
+  std::string previous;
+  for (auto const group : table::kMarks) {
+    auto const key = Key(group);
+    ASSERT_EQ(key.size(), 2 * CountUtf8CodePoints(group)) << group;
+    auto const mark = key.substr(0, 2);
+    for (size_t i = 0; i < key.size(); i += 2) EXPECT_EQ(key.substr(i, 2), mark) << group;
+    EXPECT_LT(previous, mark) << group;
+    previous = mark;
+  }
+  for (auto const &[first, last] : table::kIgnorable) {
+    for (auto const code_point : {first, last})
+      EXPECT_EQ(Key("a" + Utf8(code_point) + "b"), "ab") << static_cast<uint32_t>(code_point);
   }
 }
 

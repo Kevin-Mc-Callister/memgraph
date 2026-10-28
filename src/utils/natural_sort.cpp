@@ -12,16 +12,18 @@
 #include "utils/natural_sort.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
+#include <iterator>
+#include <string>
 #include <utility>
 
+#include "utils/logging.hpp"
 #include "utils/natural_sort_table.hpp"
 
 namespace memgraph::utils {
 
 namespace {
-
-using natural_sort::Entry;
-using natural_sort::Kind;
 
 // Key bytes are chosen so that byte order ranks the parts of a name the way the
 // collator does: marks (whitespace, punctuation, symbols) before numbers before
@@ -32,15 +34,10 @@ using natural_sort::Kind;
 // characters outside the table keep their UTF-8 bytes (0xC2 and up).
 constexpr char kMarkPrefix = 0x01;
 constexpr char kNumberPrefix = 0x02;
-static_assert(natural_sort::kMaxRank < 0x80, "a rank byte must be valid UTF-8 on its own");
+static_assert(std::size(natural_sort::kMarks) < 0x80, "a rank byte must be valid UTF-8 on its own");
 
 // Not a Unicode code point, so never in the table: a malformed byte is copied as is.
 constexpr char32_t kMalformed = 0x110000;
-
-Entry const *Find(char32_t code_point) {
-  auto const *entry = std::ranges::lower_bound(natural_sort::kTable, code_point, {}, &Entry::code_point);
-  return entry != std::ranges::end(natural_sort::kTable) && entry->code_point == code_point ? entry : nullptr;
-}
 
 // The code point of the UTF-8 sequence starting at s[pos], and its length in bytes.
 std::pair<char32_t, size_t> DecodeUtf8(std::string_view s, size_t pos) {
@@ -55,6 +52,73 @@ std::pair<char32_t, size_t> DecodeUtf8(std::string_view s, size_t pos) {
     code_point = (code_point << 6U) | (next & 0x3FU);
   }
   return {code_point, length};
+}
+
+enum class Kind : uint8_t { kKeep, kIgnore, kLetter, kMark };
+
+struct Class {
+  Kind kind = Kind::kKeep;
+  uint8_t value = 0;  // kMark: rank, from 1. kLetter: index into kFolds.
+};
+
+// The class of every code point the table covers, in two dense blocks
+// (U+0000-U+036F and General Punctuation), built once from the table.
+class Classes {
+ public:
+  Classes() {
+    for (auto const [first, last] : natural_sort::kIgnorable) {
+      for (auto code_point = first; code_point <= last; ++code_point) Set(code_point, {.kind = Kind::kIgnore});
+    }
+    for (size_t i = 0; i < std::size(natural_sort::kMarks); ++i) {
+      ForEachCodePoint(natural_sort::kMarks[i], [&](char32_t code_point) {
+        Set(code_point, {.kind = Kind::kMark, .value = static_cast<uint8_t>(i + 1)});
+      });
+    }
+    for (size_t i = 0; i < std::size(natural_sort::kFolds); ++i) {
+      ForEachCodePoint(natural_sort::kFolds[i].second, [&](char32_t code_point) {
+        Set(code_point, {.kind = Kind::kLetter, .value = static_cast<uint8_t>(i)});
+      });
+    }
+  }
+
+  Class Of(char32_t code_point) const {
+    if (code_point < kLowEnd) return low_[code_point];
+    if (code_point >= kPunctuationFirst && code_point < kPunctuationEnd) {
+      return punctuation_[code_point - kPunctuationFirst];
+    }
+    return {};
+  }
+
+ private:
+  static constexpr char32_t kLowEnd = 0x370;
+  static constexpr char32_t kPunctuationFirst = 0x2000;
+  static constexpr char32_t kPunctuationEnd = 0x2070;
+
+  void Set(char32_t code_point, Class value) {
+    MG_ASSERT(code_point < kLowEnd || (code_point >= kPunctuationFirst && code_point < kPunctuationEnd),
+              "Natural sort table lists U+{:04X} outside its blocks",
+              static_cast<uint32_t>(code_point));
+    auto &slot = code_point < kLowEnd ? low_[code_point] : punctuation_[code_point - kPunctuationFirst];
+    MG_ASSERT(slot.kind == Kind::kKeep, "Natural sort table lists U+{:04X} twice", static_cast<uint32_t>(code_point));
+    slot = value;
+  }
+
+  template <class Visit>
+  static void ForEachCodePoint(std::string_view s, Visit visit) {
+    for (size_t pos = 0; pos < s.size();) {
+      auto const [code_point, length] = DecodeUtf8(s, pos);
+      visit(code_point);
+      pos += length;
+    }
+  }
+
+  std::array<Class, kLowEnd> low_{};
+  std::array<Class, kPunctuationEnd - kPunctuationFirst> punctuation_{};
+};
+
+Class ClassOf(char32_t code_point) {
+  static Classes const classes;
+  return classes.Of(code_point);
 }
 
 template <class TString>
@@ -88,13 +152,19 @@ std::basic_string<char, std::char_traits<char>, TAllocator> *NaturalSortKey(
       ++pos;
     } else {
       auto const [code_point, length] = DecodeUtf8(s, pos);
-      if (auto const *entry = Find(code_point); entry == nullptr) {
-        out->append(s.substr(pos, length));
-      } else if (entry->kind == Kind::kLetter) {
-        out->append(entry->fold);
-      } else if (entry->kind == Kind::kMark) {
-        out->push_back(kMarkPrefix);
-        out->push_back(static_cast<char>(entry->rank));
+      switch (auto const cls = ClassOf(code_point); cls.kind) {
+        case Kind::kKeep:
+          out->append(s.substr(pos, length));
+          break;
+        case Kind::kIgnore:
+          break;
+        case Kind::kLetter:
+          out->append(natural_sort::kFolds[cls.value].first);
+          break;
+        case Kind::kMark:
+          out->push_back(kMarkPrefix);
+          out->push_back(static_cast<char>(cls.value));
+          break;
       }
       pos += length;
     }
